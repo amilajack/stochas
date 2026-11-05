@@ -12,6 +12,7 @@
 
 #include "Constants.h"
 #include "SequenceData.h"
+#include "PreparedMidiQueue.h"
 #include "SeqRandom.h"
 #include <bitset>
 
@@ -31,6 +32,8 @@ class StochaEngine {
    
    typedef std::bitset<SEQ_MAX_ROWS> DepSource;
    DepSource mDependencySource[SEQ_MAX_STEPS];
+   static constexpr unsigned PlayedWords = (SEQ_MAX_ROWS + 31) / 32;
+   std::atomic<uint32_t> mPlayed[SEQ_MAX_STEPS][PlayedWords]{};
    
    /* represent a single mapping and what it does.
       A mapping is a user defined value that says "when i hit note A4 I want to change pattern in layer x"
@@ -49,6 +52,9 @@ class StochaEngine {
    // array of items where each item may be a linked list.
    // this is indexed by the incoming value to make for speedy finding.
    MidiMappingItem *mMapping[128];
+   // One prepared node for every admitted mapping. Rebuilds may run when
+   // the first mapped MIDI message arrives on the audio thread.
+   MidiMappingItem mMappingStorage[SEQMIDI_MAX_ITEMS];
    bool mMappingIsValid;
 
    // for midi mapping, we are either overriding a value or using it's default
@@ -79,36 +85,17 @@ class StochaEngine {
    MidiOverride mOverrideMaxPoly;
    MidiOverride mOverrideSwing;
    
-   /*
-   Represents a midi event that will happen in the future
-   */
-   struct StochaEvent {
-      int mNumSamples;     // number of samples into the future that it needs to occur
-                           // this will be negative if the slot is available
-      int8_t mNote;          // the note value.
-      int8_t mVelo;          // note velocity. If 0, it's a note off
-      int8_t mChan;          // value from 1 to 16
-      StochaEvent *mCorrespondingNoteOff; // if this is a note on event, this will point at it's note off
-      StochaEvent() { clear(); }
-      void clear() {
-         mNumSamples = -1;
-         mNote = -1;
-         mVelo = -1;
-         mChan = -1;
-         mCorrespondingNoteOff = nullptr;
-      }
-      
-   };
-   // these two are just to avoid excessive looping in getMidiEvent
-   int mNumActiveNoteOnEvents;
-   int mNumActiveNoteOffEvents;
+   // Prepared operating capacity, not a limit on legal pattern/polyphony settings.
+   // Dense work beyond this budget returns an explicit scheduler failure.
+   static constexpr int PreparedEventCapacity = 4096;
+   PreparedMidiQueue<PreparedEventCapacity> mEvents;
+   int64_t mTimeline = 0;
 
    // this is the last step that was registered (might not have occurred yet)
    int mCurrentStepPosition;
    // this is the step position that is used for visually informing the user what position is current
    double mRealStepPosition;
    SeqDataBuffer *mSeq;
-   StochaEvent mEvents[SEQ_MAX_MIDI_EVENTS]; 
    int mLayer;
    struct SelectedItem {
       int rowToPlay;
@@ -212,6 +199,7 @@ public:
    Also, this will clear our dependency tracker
    */
    void playbackStopped();
+   void resetProcessingState();
 
    /*
    Call this to set manual playback start position. will be automatically reset to 0 when
@@ -285,6 +273,14 @@ public:
       (which is to update the display) it doesn't really matter
     */
    bool getStepPlayedState(int position, int notenum);
+   uint32_t getPlayedWord(int step,int word) const noexcept {
+      return step>=0&&step<SEQ_MAX_STEPS&&word>=0&&word<(int)PlayedWords?
+         mPlayed[step][word].load(std::memory_order_acquire):0;
+   }
+   void setRemotePlayedWord(int step,int word,uint32_t value) noexcept {
+      if(step>=0&&step<SEQ_MAX_STEPS&&word>=0&&word<(int)PlayedWords)
+         mPlayed[step][word].store(value,std::memory_order_release);
+   }
 
    /* incoming automation value. override it.
    */

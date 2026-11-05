@@ -128,6 +128,7 @@ target_sources(stochas PRIVATE
     src/OptionsPanel.cpp
     src/pcg_basic.c
     src/Persist.cpp
+    src/StateValidation.cpp
     src/PlayPanel.cpp
     src/PluginEditor.cpp
     src/PluginProcessor.cpp
@@ -211,4 +212,10 @@ if( APPLE )
     COMMAND auval -vt aumi AuVi
     )
 
+endif()
+
+# Port/reference verification is explicit and never installs or opens an editor.
+option(STOCHAS_PORT_TESTS "Build native Stochas port verification tools" OFF)
+if(STOCHAS_PORT_TESTS AND APPLE)
+  add_subdirectory(web/tests)
 endif()

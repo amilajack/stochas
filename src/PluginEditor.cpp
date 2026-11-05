@@ -10,6 +10,7 @@
 
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "FileImport.h"
 #include "Persist.h"
 
 /* Given a number of steps, return number of pages needed to accommodate that
@@ -339,6 +340,7 @@ SeqAudioProcessorEditor::SeqAudioProcessorEditor(SeqAudioProcessor &p)
 
 SeqAudioProcessorEditor::~SeqAudioProcessorEditor()
 {
+   mProcessor.requestAuditionRelease();
    // avoid an assert
    setLookAndFeel(nullptr);
 
@@ -1149,34 +1151,28 @@ void SeqAudioProcessorEditor::respondFileChooser()
       for (int i = 0; i < SEQ_MAX_ROWS - 1; i++)
       {
          char *nn = sl->getNoteName(i);
+         if(String::fromUTF8(nn).containsAnyOf("\r\n")) {
+            setAlertText("Note lists cannot store line breaks in labels; save a full preset instead");
+            return;
+         }
          int8_t n = sl->getCurNote(i);
          noteLines.append(String::formatted("%d \"", (int)n), 5);
          noteLines.append(nn, SEQ_MAX_NOTELABEL_LEN);
          noteLines.append("\"\n", 2);
       }
-      noteFile.replaceWithText(noteLines);
+      setAlertText(noteFile.replaceWithText(noteLines)?String{}:String{"Failed to write note list"});
    }
 
    break;
    case SEQ_FILE_LOAD_NOTES:
    {
-      StringArray noteLines;
-      File noteFile(mFileChooser.mFileName);
-      noteFile.readLines(noteLines);
-      for (int i = 0; i < SEQ_MAX_ROWS - 1; i++)
-      {
-         StringArray pair;
-         String theName;
-         int nval;
-         if (noteLines.size() > i)
-         {
-            pair = StringArray::fromTokens(noteLines[i], true);
-            nval = pair[0].getIntValue();
-            theName = pair[1].removeCharacters("\"");
-            sl->setNoteName(i, theName.getCharPointer());
-            if (nval < 128 && nval > -1)
-               sl->setNote(i, (int8_t)nval, true);
-         }
+      SeqFileImport::Notes notes;size_t count=0;String error;
+      if(!SeqFileImport::notes(File(mFileChooser.mFileName),notes,count,error)) {
+         setAlertText(error);break;
+      }
+      for(size_t i=0;i<count;++i) {
+         sl->setNoteName((int)i,notes[i].name.toRawUTF8());
+         sl->setNote((int)i,notes[i].note,true);
       }
       mGlob.mSeqBuf->swap(); // since we may have called setNote
    }
@@ -1250,77 +1246,16 @@ void SeqAudioProcessorEditor::scrollBarMoved(ScrollBar *sb, double newRangeStart
 
 void SeqAudioProcessorEditor::loadMidiGroove(const String &filename)
 {
-   SeqDataBuffer *sd = mGlob.mSeqBuf;
-   SequenceData *s = sd->getUISeqData();
-
-   // changing groove value resets swing to 0
-   s->setSwing(0);
-
-   short tpqn;
-   setAlertText("");
-   File f(filename);
-   std::unique_ptr<FileInputStream> stream = f.createInputStream();
-   if (!stream)
-   {
-      setAlertText("Failed to open MIDI file for reading");
-      return;
+   auto *sequence=mGlob.mSeqBuf->getUISeqData();
+   std::array<int,SEQ_DEFAULT_NUM_STEPS> groove;
+   for(int i=0;i<SEQ_DEFAULT_NUM_STEPS;++i)groove[(size_t)i]=sequence->getGroove(i);
+   String error;
+   if(!SeqFileImport::groove(File(filename),groove,error)) {
+      setAlertText(error);return;
    }
-
-   MidiFile file;
-   if (!file.readFrom(*stream) || file.getNumTracks() == 0)
-   {
-      setAlertText("Failed to read data from file. Possibly it is not a MIDI file, or it has no valid tracks.");
-      return;
-   }
-
-   tpqn = file.getTimeFormat();
-   if (tpqn < 0)
-   {
-      setAlertText("MIDI file is wrong time format (must be ticks-per-quarter-note format)");
-      return;
-   }
-
-   // determine how many ticks per 16th note (step)
-   int tps = tpqn / 4;
-   int numtracks = file.getNumTracks();
-
-   // loop thru all data in all tracks, extracting note-on events.
-   // this will effectively mean that the groove is whatever the last
-   // note-on events were seen
-   for (int curtrack = 0; curtrack < numtracks; curtrack++)
-   {
-      const MidiMessageSequence *seq = file.getTrack(curtrack);
-      int len = seq->getNumEvents();
-      for (int i = 0; i < len; i++)
-      {
-         const MidiMessageSequence::MidiEventHolder *e = seq->getEventPointer(i);
-         if (e->message.isNoteOn())
-         {
-            // determine what step position it has an affinity for
-            double ts = seq->getEventTime(i); // in ticks
-            int step;
-            int step_before = (int)(ts / tps); // step before
-            int distance = (int)ts % tps;      // distance to the right of that step
-            if (distance <= tps / 2)
-            {
-               step = step_before; // closer to the step before
-            }
-            else
-            {
-               step = step_before + 1; // closer to the step after
-               distance -= tps;        // convert to a negative number representing the distance
-            }
-
-            step %= SEQ_DEFAULT_NUM_STEPS; // should be range of 0..15
-            distance = juce::roundToInt((double)distance / (double)tps * 100.0);
-            // distance will always be in the range -50 to 50
-
-            s->setGroove(step, distance);
-         }
-      }
-   }
-
-   sd->swap();
+   setAlertText("");sequence->setSwing(0);
+   for(int i=0;i<SEQ_DEFAULT_NUM_STEPS;++i)sequence->setGroove(i,groove[(size_t)i]);
+   mGlob.mSeqBuf->swap();
 }
 
 void SeqAudioProcessorEditor::saveMidiGroove(const String &filename)
@@ -1329,13 +1264,9 @@ void SeqAudioProcessorEditor::saveMidiGroove(const String &filename)
    SequenceData *s = sd->getUISeqData();
 
    setAlertText("");
-   File f(filename);
-   if (!f.deleteFile())
-   {
-      setAlertText("Failed to open MIDI file for writing");
-      return;
-   }
-   std::unique_ptr<FileOutputStream> stream = f.createOutputStream();
+   const File target(filename);
+   TemporaryFile temporary(target);
+   std::unique_ptr<FileOutputStream> stream = temporary.getFile().createOutputStream();
    if (!stream)
    {
       setAlertText("Failed to open MIDI file for writing");
@@ -1382,7 +1313,12 @@ void SeqAudioProcessorEditor::saveMidiGroove(const String &filename)
    if (!file.writeTo(*stream))
    {
       setAlertText("Failed to write to file");
+      return;
    }
+   stream->flush();
+   if(stream->getStatus().failed()) {setAlertText("Failed to flush MIDI file");return;}
+   stream.reset();
+   if(!temporary.overwriteTargetFileWithTemporary())setAlertText("Failed to replace MIDI file");
 }
 
 void SeqAudioProcessorEditor::editorShown(Label *lbl, TextEditor &te)
@@ -1432,7 +1368,7 @@ void SeqAudioProcessorEditor::loadPatch(const String &fn)
 
    if (persist.retrieve(mGlob.mSeqBuf->getUISeqData(), xml.get()))
    {
-      mGlob.mSeqBuf->swap();
+      mGlob.mSeqBuf->swap(true);
       // for standalone mode, tempo may be different in what we are loading. send notification
       mGlob.mProcessNotify->addToFifo(SEQ_STANDALONE_SET_TEMPO, 0, 0);
    }
@@ -1445,7 +1381,7 @@ void SeqAudioProcessorEditor::savePatch(const String &fn)
    setAlertText("");
 
    SeqPersist persist;
-   const XmlElement &xml = persist.store(mGlob.mSeqBuf->getAudSeqData());
+   const XmlElement &xml = persist.store(mGlob.mSeqBuf->getPublishedSeqData());
 
    if (!xml.writeTo(File(fn).withFileExtension("stochas"), juce::XmlElement::TextFormat()))
       setAlertText("Failed to write to file");
@@ -1504,6 +1440,10 @@ void SeqAudioProcessorEditor::checkForRecordedNotes()
 void SeqAudioProcessorEditor::mainTimer()
 {
    // this timer is running at 30hz
+   const bool overloaded=mProcessor.hasSchedulingOverload();
+   if(overloaded&&!mReportedOverload)
+      setAlertText("Processing capacity exceeded; playback stopped safely. Stop transport before retrying.");
+   mReportedOverload=overloaded;
 
    int8_t type, chan, num, val;
 

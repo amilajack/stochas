@@ -38,6 +38,7 @@ class SeqRandom {
 
    // we store just the state, since the seqno doesn't change. so save some memory
    uint64_t mKeyFrames[NUM_KEY_FRAMES];
+   bool mKeyFrameValid[NUM_KEY_FRAMES]{};
    // store last generated because we are moving sequentially most of the time, so no
    // need to regenerate number since beginning of keyframe
    uint64_t mSequenceNumber;

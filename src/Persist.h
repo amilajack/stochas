@@ -30,10 +30,12 @@ class SeqPersist {
    void storeLayer(int idx, SequenceLayer *item, XmlElement *parent);
    void storeNote(int idx, SequenceLayer *item, XmlElement *parent);
    void storePattern(int idx, SequenceLayer *item, XmlElement *parent);
-   bool storeRow(int idx, int pat, SequenceLayer *item, XmlElement *parent);
-   bool storeCell(int idx, int pat, int row, SequenceLayer *item, XmlElement *parent);
+   bool storeRow(int idx, int pat, SequenceLayer *item, XmlElement *parent, uint64_t chainColumns);
+   bool storeCell(int idx, int pat, int row, SequenceLayer *item, XmlElement *parent, bool hasChain);
 public:
    SeqPersist() : mRoot("stochas") {}
+   static bool validate(const XmlElement *sourceData);
+   static bool validMapping(const SeqMidiMapItem &mapping);
    // save the sequence data to XML and returns a ref to it.
    const XmlElement &store(SequenceData *sourceData);
 

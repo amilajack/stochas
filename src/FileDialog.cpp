@@ -12,6 +12,14 @@
 void SeqFileDialog::endDialog(bool hitOk)
 {   
    if (hitOk) {
+#if JUCE_WASM
+      if(mComputerResult.isNotEmpty()) {
+         mFileName=mComputerResult;mComputerResult.clear();
+         mLastLocation=File(mFileName).getParentDirectory();
+         mGlob->mEditorState->setFileDirectory(mLastLocation.getFullPathName());
+         notifyParent(0);return;
+      }
+#endif
       if (mBrowser->getNumSelectedFiles() > 0) {
          mLastLocation = mBrowser->getSelectedFile(0).getParentDirectory();
          mGlob->mEditorState->setFileDirectory(mLastLocation.getFullPathName());
@@ -30,6 +38,11 @@ void SeqFileDialog::notify(int id, int /*val*/) {
    case CPTID_CANCEL:
       closeDialog(false);
       break;
+#if JUCE_WASM
+   case CPTID_COMPUTER:
+      chooseComputerFile();
+      break;
+#endif
    default:
       jassertfalse;
    }
@@ -57,6 +70,9 @@ void SeqFileDialog::resizedInner(Component * inner) {
    btns.removeFromRight(S_GAP);
    tmp = btns.removeFromRight(60);
    mBtnOk->setBounds(tmp);
+#if JUCE_WASM
+   mBtnComputer->setBounds(btns.removeFromLeft(190));
+#endif
 
 }
 
@@ -124,6 +140,10 @@ void SeqFileDialog::doSetup(int mode)
 
 
    int fflags = 0;
+#if JUCE_WASM
+   mComputerResult.clear();mSaveToComputer=saveMode;
+   mBtnComputer->setButtonText(saveMode?"Download to computer...":"Choose on computer...");
+#endif
    if (saveMode)
       fflags = FileBrowserComponent::FileChooserFlags::saveMode;
    else
@@ -150,6 +170,9 @@ SeqFileDialog::SeqFileDialog(SeqGlob * glob, CptNotify * parent) :
    
    mBtnOk = std::unique_ptr<TextButton>(addStdButton("Ok", 0, CPTID_OK));
    mBtnCancel = std::unique_ptr<TextButton>(addStdButton("Cancel", 0, CPTID_CANCEL));
+#if JUCE_WASM
+   mBtnComputer=std::unique_ptr<TextButton>(addStdButton("Choose on computer...",0,CPTID_COMPUTER));
+#endif
 
    mLblMain = std::unique_ptr<Label>(addStdLabel("Select a file")); // will be changed as appropriate
    mLblMain->setFont(Font(20.0f, Font::plain));
@@ -170,3 +193,30 @@ SeqFileDialog::~SeqFileDialog() {
       delete mBrowser.release();
    }
 }
+
+#if JUCE_WASM
+void SeqFileDialog::chooseComputerFile()
+{
+   if (!mBtnComputer->isEnabled()) return;
+   String pattern,defaultName;
+   switch(mMode) {
+   case SEQ_FILE_SAVE_NOTES:case SEQ_FILE_LOAD_NOTES:pattern="*.stnote";defaultName="Notes.stnote";break;
+   case SEQ_FILE_SAVE_PATCH:case SEQ_FILE_LOAD_PATCH:pattern="*.stochas";defaultName="Untitled.stochas";break;
+   default:pattern="*.mid;*.midi";defaultName="Groove.mid";break;
+   }
+   const File initial=mBrowser&&mBrowser->getNumSelectedFiles()?mBrowser->getSelectedFile(0):mLastLocation.getChildFile(defaultName);
+   mComputerChooser=std::make_unique<FileChooser>(mSaveToComputer?"Save Stochas file":"Open Stochas file",initial,pattern,true);
+   mBtnComputer->setEnabled(false);
+   const int flags=FileBrowserComponent::canSelectFiles|(mSaveToComputer?FileBrowserComponent::saveMode:FileBrowserComponent::openMode);
+   Component::SafePointer<SeqFileDialog> safe(this);
+   mComputerChooser->launchAsync(flags,[safe](const FileChooser &chooser) {
+      if(!safe)return;
+      safe->mBtnComputer->setEnabled(true);
+      if(chooser.getResult()==File{})return;
+      safe->mComputerResult=chooser.getResult().getFullPathName();
+      // Preserve the original synchronous save/load callback. The platform
+      // writer copies the completed virtual file only after this returns.
+      safe->closeDialog(true);
+   });
+}
+#endif

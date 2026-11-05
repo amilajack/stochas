@@ -9,6 +9,18 @@
  ***************************************************************/
 #include "SequenceData.h"
 #include "EditorState.h" // just for random seed function
+#include <algorithm>
+#include <cstring>
+namespace {
+template<size_t N> void copyLabel(char (&destination)[N], const char *text) {
+   // Keep existing byte limits without leaving half of a UTF-8 code point.
+   // A local copy also permits renaming a label from its own current value.
+   char prepared[N]{};
+   size_t count=std::min(std::strlen(text),N-1);
+   while(count&&!juce::CharPointer_UTF8::isValidString(text,(int)count))--count;
+   std::memcpy(prepared,text,count);std::memcpy(destination,prepared,N);
+}
+}
 SeqMidiMapItem gDefaultMidiMapItems[SEQMIDI_NUM_DEFAULT_ITEMS] =
 {
    // action, target, value, note, channel
@@ -128,7 +140,7 @@ void SeqProcessorNotifier::setRandomSeed(int64 seed)
 {
    mRandomSeed.set(seed);
 }
-void SeqProcessorNotifier::addCompletedMidiNote(int number, int velocity, int len, int pos)
+bool SeqProcessorNotifier::addCompletedMidiNote(int number, int velocity, int len, int pos)
 {
    int third;
    jassert(number < 128);
@@ -136,7 +148,7 @@ void SeqProcessorNotifier::addCompletedMidiNote(int number, int velocity, int le
    jassert(len < SEQ_MAX_STEPS); // length is 0 based
    jassert(pos < SEQ_MAX_STEPS);
    third = (len << 8) + pos;
-   mCompletedNoteFifo.addToFifo(number, velocity, third);
+   return mCompletedNoteFifo.addToFifoTagged(mRecordingGeneration,number, velocity, third);
 }
 void SeqProcessorNotifier::setRecordingState(PlayRecordState state)
 {
@@ -170,7 +182,7 @@ SeqProcessorNotifier::getCompletedMidiNote(int * number, int * velocity, int * l
 
 void SeqProcessorNotifier::clearCompletedMidiNotes()
 {
-   mCompletedNoteFifo.clearFifo();
+   mRecordingGeneration=mCompletedNoteFifo.invalidateGeneration();
 }
 
 bool
@@ -183,26 +195,29 @@ SeqProcessorNotifier::doesUINeedUpdate()
 /*============================================
 SeqDataBuffer
 *============================================*/
-void SeqDataBuffer::swap()
+void SeqDataBuffer::swap(bool refreshMappings)
 {
-   /*Theoretically, if the ui thread swaps this twice while the audio thread is
-     still reading values, the audio thread might be picking up torn values, etc.
-     In practice I don't believe this would happen due to: a) audio thread does
-     quick reads of individual values, b) audio thread sets these in batches where
-     more than one is being set at a time
-   */
-
-   int cur = mCurrent.get(); // the one the audio is looking at now
-   int wanted = cur ? 0 : 1; // which one the audio needs to look at
-                             // tell the audio to look at the other one
-   mCurrent.set(wanted);
-   
-   // mBuffer[cur] contains info that we can use for UNDO
-   mUndoBuffer = mBuffer[cur];
-
-   // now copy data from the one the audio is looking at into the one
-   // that the ui now has      
-   mBuffer[cur] = mBuffer[wanted];
+   // Both copies are control-thread work. Save the prior published edit before
+   // exchanging slots: it may become our next writable slot after publication.
+   mUndoBuffer = *getPublishedSeqData();
+   const auto wanted = mSlots.writerSlot();
+   if(refreshMappings)++mNextStateRevision;
+   mStateRevision[wanted]=mNextStateRevision;
+   auto *edited = getUISeqData();
+   if (edited->getMappingCount() != mUndoBuffer.getMappingCount()) refreshMappings = true;
+   for (int index = 0; !refreshMappings && index < edited->getMappingCount(); ++index) {
+      const auto *a = edited->getMappingItem(index), *b = mUndoBuffer.getMappingItem(index);
+      refreshMappings = a->mAction != b->mAction || a->mChannel != b->mChannel ||
+         a->mNote != b->mNote || a->mTarget != b->mTarget ||
+         a->mType != b->mType || a->mValue != b->mValue;
+   }
+   if (refreshMappings) ++mNextMappingRevision;
+   mMappingRevision[wanted] = mNextMappingRevision;
+   mSlots.publish();
+   ++mControlRevision;
+   *getUISeqData() = mBuffer[wanted];
+   mMappingRevision[mSlots.writerSlot()] = mNextMappingRevision;
+   mStateRevision[mSlots.writerSlot()] = mNextStateRevision;
 
    // send notification that data is changing
    if (mCB && mCBHandle)
@@ -213,7 +228,7 @@ void SeqDataBuffer::swap()
 void SeqDataBuffer::undo()
 {
    // set UI buffer to undo buffer
-   mBuffer[mCurrent.get() ? 0 : 1] = mUndoBuffer;
+   *getUISeqData() = mUndoBuffer;
    swap(); // note that new undo buffer will contain state before undo
            // thus facilitating redo... how convenient!
 }
@@ -322,7 +337,7 @@ SequenceData::clearMapping()
 void
 SequenceData::setMappingCount(int count) 
 {
-   jassert(count >= 0 && count < SEQMIDI_MAX_ITEMS);
+   jassert(count >= 0 && count <= SEQMIDI_MAX_ITEMS);
    mMidiMapCount = count;
 
 }
@@ -888,8 +903,7 @@ void
 SequenceLayer::setNoteName(int row, const char * name) 
 {
    jassert(row >= 0 && row < SEQ_MAX_ROWS);
-   memset(mNoteSets[customSet].notes[row].noteName, 0, SEQ_MAX_NOTELABEL_LEN);
-   strncpy(mNoteSets[customSet].notes[row].noteName, name, SEQ_MAX_NOTELABEL_LEN);
+   copyLabel(mNoteSets[customSet].notes[row].noteName,name);
 }
 
 // get note from "current" (either custom or standard)
@@ -1080,8 +1094,7 @@ const char * SequenceLayer::getLayerName()
 
 void SequenceLayer::setLayerName(const char * txt)
 {
-   strncpy(mLayerName, txt, SEQ_LAYER_NAME_MAXLEN);
-   mLayerName[SEQ_LAYER_NAME_MAXLEN - 1] = 0;
+   copyLabel(mLayerName,txt);
 }
 
 void SequenceLayer::setPatternName(const char * txt, int pat)
@@ -1089,8 +1102,7 @@ void SequenceLayer::setPatternName(const char * txt, int pat)
    if (pat == -1)
       pat = mCurrentPattern;
    jassert(pat >= 0 && pat < SEQ_MAX_PATTERNS);
-   strncpy(mPats[pat].mName, txt, SEQ_PATTERN_NAME_MAXLEN);
-   mPats[pat].mName[SEQ_PATTERN_NAME_MAXLEN - 1] = 0;
+   copyLabel(mPats[pat].mName,txt);
 
 }
 

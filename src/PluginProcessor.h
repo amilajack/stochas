@@ -13,6 +13,7 @@
 
 #include "SequenceData.h"
 #include "StochaEngine.h"
+#include <atomic>
 class EditorState;
 class SeqAudioProcessor;
 
@@ -101,7 +102,7 @@ class SeqAudioProcessorParameter : public AudioProcessorParameter {
    int mParamId;
    int mRangeLo;
    int mRangeHi;
-   int mValue;    // actual value. value of mRangeLo-1 indicates default here   
+   juce::Atomic<int> mValue;    // actual value. value of mRangeLo-1 indicates default here
    String mName;
    
 public:
@@ -120,7 +121,7 @@ public:
 // check the value of mValue from pluginProcessor to see if play is allowed.
 class SeqPlaybackParameter : public AudioProcessorParameter {
    SeqAudioProcessor *mParent;
-   int mValue; // 0,1 or 2
+   juce::Atomic<int> mValue; // 0,1 or 2
    // Inherited via AudioProcessorParameter
    virtual int getNumSteps() const override { return 3; }
    virtual bool isDiscrete() const override { return true; }
@@ -155,13 +156,34 @@ struct MidiRecordEvent {
 
 /**
 */
-class SeqAudioProcessor  : public AudioProcessor, public SeqProcessorNotifierHelper, public AutParamNotify
+class SeqAudioProcessor  : public AudioProcessor, public SeqProcessorNotifierHelper, public AutParamNotify, private juce::Timer
 {
    friend class SeqPlaybackParameter;
 
    MidiRecordEvent mMidiRecord[128];
+   MidiBuffer mProcessedMidi;
+   MidiBuffer mRecordedNotes;
+   int mOutputEventCount = 0;
+   int mRecordedEventCount = 0;
+   std::atomic<bool> mSchedulingOverload{false};
+   std::atomic<bool> mOverloadLatched{false};
+   bool mPendingHostReset = false;
+   uint64_t mPlaybackSeedState = 1;
+   static_assert(std::atomic<uint32_t>::is_always_lock_free, "RT notification flags must be lock-free");
+   static_assert(SEQ_MAX_LAYERS * 13 + 2 <= 64, "prepared reset feedback mask capacity");
+   std::atomic<uint32_t> mResetFeedbackLow{0}, mResetFeedbackHigh{0};
+   std::atomic<bool> mHostDirty{false};
+   void timerCallback() override { flushParameterResetNotifications(); flushHostDirtyNotification(); }
+   int64 nextPlaybackSeed() noexcept;
+   static constexpr int PreparedMidiEvents = 1024;
+   static constexpr int PreparedMidiBytes = 65536;
+   bool appendPreparedMidi(MidiBuffer &buffer, const void *bytes, int length, int sample);
+   bool appendPreparedMidi(MidiBuffer &buffer, const MidiMessage &message, int sample) {
+      return appendPreparedMidi(buffer, message.getRawData(), message.getRawDataSize(), sample);
+   }
     void prepareToPlay (double sampleRate, int samplesPerBlock) override;
     void releaseResources() override;
+    void reset() override;
    #ifndef JucePlugin_PreferredChannelConfigurations
     bool isBusesLayoutSupported(const BusesLayout& layouts) const override;
    #endif
@@ -185,6 +207,21 @@ class SeqAudioProcessor  : public AudioProcessor, public SeqProcessorNotifierHel
     // cleared at some point after we stop. It's used to determine if we
     // are transitioning to playing or transitioning to stopping
     bool mPlaying;
+    uint64_t mAppliedMappingRevision = 0; // audio consumer only
+    uint64_t mAppliedStateRevision = 0;
+    void resetProcessingState(bool discardCommands);
+    static constexpr unsigned PendingAutomationCount = 55;
+    static_assert(PendingAutomationCount <= 64);
+    std::atomic<int> mPendingAutomation[PendingAutomationCount]{};
+    std::atomic<uint32_t> mPendingAutomationLow{0}, mPendingAutomationHigh{0};
+    void queueAutomation(unsigned index, int value) noexcept;
+    void applyPendingAutomation();
+    void applyAutomationParameter(int paramId, int paramValue, int layer);
+    struct AuditionNote { int channel=0,note=-1; };
+    AuditionNote mAuditions[SEQ_MAX_LAYERS][SEQ_MAX_ROWS]{};
+    unsigned mAuditionCount = 0; // audio consumer only
+    std::atomic<bool> mReleaseAuditions{false};
+    void releaseAuditions(MidiBuffer &output);
     // standalone midi clock/transport output state
     bool mClockPrimed = false;
     int64 mClockNextTick = 0; // next midi clock tick (1/24 beat) to send
@@ -210,7 +247,8 @@ class SeqAudioProcessor  : public AudioProcessor, public SeqProcessorNotifierHel
        int8_t mChannel;  // 1 based channel
        int8_t mValue;       // one of SEQMIDI_VALUE_PLAYBACK_*** or 0 if inactive
     };
-    MiniMidiMapItem *mMiniMidiMap[128]; // can't have more than start/stop/toggle
+    MiniMidiMapItem *mMiniMidiMap[128];
+    MiniMidiMapItem mMiniMidiStorage[SEQMIDI_MAX_ITEMS];
     void resetMiniMidiMap();
     void rebuildMiniMidiMap();
     void handleMiniMidiMap(int type, int8_t number, int8_t chan, int8_t val);
@@ -249,9 +287,34 @@ class SeqAudioProcessor  : public AudioProcessor, public SeqProcessorNotifierHel
    
    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(SeqAudioProcessor)
 public:
+    // Main/control thread: validate and prepare before publishing; refusal
+    // leaves the live sequence, mappings and notifier unchanged.
+    bool loadCanonicalState(const void* data, int sizeInBytes);
+    // The caller has fully validated its exclusively owned UI staging model.
+    // XML presets and the WCLAP compact runtime codec share this publication.
+    void commitPreparedState();
+    void queuePlaybackParameter(int value) noexcept { queueAutomation(54, value); }
+    void requestAuditionRelease() noexcept { mReleaseAuditions.store(true,std::memory_order_release); }
    // persist this in the processor so that user state is preserved when a new editor is created
    EditorState *mEditorState;
 
+   // Each deployment has one consumer: native control Timer, or the WCLAP
+   // adapter's main-thread/output bridge. No listener mutex is taken on audio.
+   uint64_t consumeParameterResetNotifications() noexcept {
+      return uint64_t(mResetFeedbackLow.exchange(0, std::memory_order_acq_rel)) |
+         (uint64_t(mResetFeedbackHigh.exchange(0, std::memory_order_acq_rel)) << 32);
+   }
+   void flushParameterResetNotifications();
+   bool consumeHostDirtyNotification() noexcept { return mHostDirty.exchange(false, std::memory_order_acquire); }
+   bool hasHostDirtyNotification() const noexcept { return mHostDirty.load(std::memory_order_acquire); }
+   void flushHostDirtyNotification();
+   uint32_t getPlayedWord(int layer, int step, int word) const;
+   void setRemotePlayedWord(int layer, int step, int word, uint32_t value);
+   // Adapters must treat true as explicit processing failure and release their
+   // downstream notes. The original native editor is informed through telemetry.
+   bool hasSchedulingOverload() const noexcept { return mSchedulingOverload || mOverloadLatched; }
+   void setRemoteOverload(bool value) noexcept { mOverloadLatched.store(value,std::memory_order_release); }
+   static constexpr int midiStorageBytes() noexcept { return PreparedMidiBytes; }
    SeqAudioProcessor();
    ~SeqAudioProcessor();
 

@@ -9,6 +9,8 @@
  ***************************************************************/
 
 #include "EditorState.h"
+#include <cstdlib>
+#include <stdexcept>
 #define COLORS_H_INCLUDE
 #include "Colors.h"
 #include "Constants.h"
@@ -308,7 +310,7 @@ void EditorState::setPPQOffset(int offset)
 
 int EditorState::getPPQOffset()
 {
-   return mPPQOffset;
+   return mPPQOffset.get();
 }
 
 void EditorState::setScaleFactor(int factor)
@@ -322,6 +324,13 @@ int EditorState::getScaleFactor()
 }
 
 String getConfigurationFolder() {
+   // Native reference tests and sandboxed hosts can isolate preferences without
+   // changing the user's HOME or installed plug-in settings. Defaults are intact.
+   if (const auto *root = std::getenv("STOCHAS_CONFIG_ROOT")) {
+      if (File::isAbsolutePath(root))
+         return root;
+      throw std::invalid_argument("STOCHAS_CONFIG_ROOT must be absolute");
+   }
 #ifdef __linux__
    const char* xdgConfigHome = std::getenv(XDG_CONFIG_HOME);
 
@@ -335,7 +344,7 @@ String getConfigurationFolder() {
 #endif
 }
 
-void EditorState::configSerialization(bool read)
+bool EditorState::configSerialization(bool read)
 {
    int tmp;
    juce::PluginHostType hostType;
@@ -369,7 +378,9 @@ void EditorState::configSerialization(bool read)
       tmp = 22;
    else
       tmp = 0;
-   configGetSetInt(pf, read, mPPQOffset, "positionOffset", SEQ_POS_OFFSET_MIN, SEQ_POS_OFFSET_MAX, tmp);
+   int positionOffset = mPPQOffset.get();
+   configGetSetInt(pf, read, positionOffset, "positionOffset", SEQ_POS_OFFSET_MIN, SEQ_POS_OFFSET_MAX, tmp);
+   mPPQOffset.set(positionOffset);
 
    configGetSetInt(pf, read, mScaleFactor, "uiScaleFactor", SEQ_UI_SCALE_MIN, SEQ_UI_SCALE_MAX, SEQ_UI_SCALE_DEFAULT);
 
@@ -384,8 +395,7 @@ void EditorState::configSerialization(bool read)
    if (read)
       setColorTheme(mColorTheme); // force load of custom colors if applicable
 
-   if (!read)
-      appProperties.saveIfNeeded();
+   return read || appProperties.saveIfNeeded();
 }
 
 void EditorState::loadColorsFromFile()

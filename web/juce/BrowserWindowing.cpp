@@ -1,0 +1,642 @@
+#include "BrowserExports.h"
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Embedded EM_ASM JavaScript must not be reformatted as C++.
+// clang-format off
+#include <emscripten.h>
+#include <emscripten/html5.h>
+#include <set>
+#include <utility>
+namespace juce
+{
+namespace
+{
+Point<float> browserMouse;
+std::set<int> browserKeys;
+// DOM keyCode to JUCE key code. Letters, digits, space, Return, Escape, Tab and
+// Backspace share values, as do the OEM punctuation codes that the native
+// virtual-keyboard layouts use. Comma and period are characters there, and in
+// the Alt+, and Alt+. shortcuts, so they map to ',' and '.'. Navigation and
+// editing keys move out of the ASCII range so '.' no longer aliases Delete.
+int browserKeyCode(int domCode)
+{
+    if (domCode >= 112 && domCode <= 135) return KeyPress::F1Key + domCode - 112;
+    switch (domCode)
+    {
+    case 33: return KeyPress::pageUpKey;
+    case 34: return KeyPress::pageDownKey;
+    case 35: return KeyPress::endKey;
+    case 36: return KeyPress::homeKey;
+    case 37: return KeyPress::leftKey;
+    case 38: return KeyPress::upKey;
+    case 39: return KeyPress::rightKey;
+    case 40: return KeyPress::downKey;
+    case 45: return KeyPress::insertKey;
+    case 46: return KeyPress::deleteKey;
+    case 106: return KeyPress::numberPadMultiply;
+    case 107: return KeyPress::numberPadAdd;
+    case 109: return KeyPress::numberPadSubtract;
+    case 110: return KeyPress::numberPadDecimalPoint;
+    case 111: return KeyPress::numberPadDivide;
+    case 188: return ',';
+    case 190: return '.';
+    default: break;
+    }
+    if (domCode >= 96 && domCode <= 105) return KeyPress::numberPad0 + domCode - 96;
+    return domCode;
+}
+int browserPeerId = 0;
+TextInputTarget *browserCompositionTarget = nullptr;
+uint64_t browserCompositionSerial = 0;
+Component::SafePointer<Component> browserCompositionComponent;
+} // namespace
+class BrowserPeer final : public ComponentPeer
+{
+    const int inputPeerId{++browserPeerId};
+    String canvasId;
+    Rectangle<int> bounds;
+    bool visible = true, fullscreen = false, dirty = true, repaintAll = true;
+    double pixelScale = 1.;
+    Image backing;
+    // What needs painting, in component coordinates: only that part of the backing
+    // store is repainted and copied to the canvas (at 2x a full repaint is four
+    // times the pixels, and meters repaint 30 times a second).
+    RectangleList<int> dirtyRegion;
+    std::vector<uint8_t> rgba;
+    static double windowPixelRatio() { return MAIN_THREAD_EM_ASM_DOUBLE({ return StochasHost.pixelRatio(); }); }
+    static ModifierKeys mouseModifiers(const EmscriptenMouseEvent &event)
+    {
+        return ModifierKeys((event.shiftKey ? ModifierKeys::shiftModifier : 0) |
+                            (event.ctrlKey ? ModifierKeys::ctrlModifier : 0) |
+                            (event.altKey ? ModifierKeys::altModifier : 0) |
+                            (event.metaKey ? ModifierKeys::commandModifier : 0) |
+                            (event.buttons & 1 ? ModifierKeys::leftButtonModifier : 0) |
+                            (event.buttons & 2 ? ModifierKeys::rightButtonModifier : 0) |
+                            (event.buttons & 4 ? ModifierKeys::middleButtonModifier : 0));
+    }
+    static bool mouse(int type, const EmscriptenMouseEvent *event, void *ctx)
+    {
+        auto &p = *static_cast<BrowserPeer *>(ctx);
+        const auto modifiers = mouseModifiers(*event);
+        ModifierKeys::currentModifiers = modifiers;
+        // Desktop coordinates are relative to the application's container.
+        browserMouse = {float(event->clientX) - float(MAIN_THREAD_EM_ASM_DOUBLE({ return StochasHost.origin().x; })),
+                        float(event->clientY) - float(MAIN_THREAD_EM_ASM_DOUBLE({ return StochasHost.origin().y; }))};
+        // A plugin's container may have moved since the last display refresh.
+        if (type == EMSCRIPTEN_EVENT_MOUSEDOWN && MAIN_THREAD_EM_ASM_INT({ return StochasHost.displaysStale(); }))
+            const_cast<Displays &>(Desktop::getInstance().getDisplays()).refresh();
+        if (type == EMSCRIPTEN_EVENT_MOUSEDOWN &&
+            (p.getStyleFlags() & windowIgnoresKeyPresses) == 0)
+            MAIN_THREAD_EM_ASM({ StochasHost.canvas(UTF8ToString($0)).focus(); }, p.canvasId.toRawUTF8());
+        p.handleMouseEvent(MouseInputSource::InputSourceType::mouse,
+                           {float(event->targetX), float(event->targetY)}, modifiers,
+                           MouseInputSource::invalidPressure, MouseInputSource::invalidOrientation,
+                           int64(Time::getMillisecondCounter()));
+        return true;
+    }
+    static bool focus(int type, const EmscriptenFocusEvent *, void *ctx)
+    {
+        auto &p = *static_cast<BrowserPeer *>(ctx);
+        if (type == EMSCRIPTEN_EVENT_FOCUS)
+        {
+            if (!p.component.hasKeyboardFocus(true)) p.handleFocusGain();
+        }
+        else
+        {
+            browserKeys.clear();
+            ModifierKeys::currentModifiers = ModifierKeys{};
+            p.handleKeyUpOrDown(false);
+            // Moving between a canvas and its accessible DOM controls retains
+            // the same JUCE peer. In particular, do not close type-ahead editors.
+            if (!MAIN_THREAD_EM_ASM_INT({ const c=StochasHost.canvas(UTF8ToString($0));
+                return c.stochasFocusDestination === c.id; }, p.canvasId.toRawUTF8()))
+                p.handleFocusLoss();
+        }
+        return false;
+    }
+    static bool key(int type, const EmscriptenKeyboardEvent *event, void *ctx)
+    {
+        auto &p = *static_cast<BrowserPeer *>(ctx);
+        p.syncInput();
+        if (MAIN_THREAD_EM_ASM_INT({ return StochasTextInput.isComposing($0); }, p.inputPeerId) ||
+            (p.activeInput() && (event->keyCode == 229 || String::fromUTF8(event->key) == "Dead")))
+            return false;
+        const int code = event->keyCode;
+        const bool down = type == EMSCRIPTEN_EVENT_KEYDOWN;
+        if (down)
+            browserKeys.insert(browserKeyCode(code));
+        else
+            browserKeys.erase(browserKeyCode(code));
+        int flags = (event->shiftKey ? ModifierKeys::shiftModifier : 0) |
+                    (event->ctrlKey ? ModifierKeys::ctrlModifier : 0) |
+                    (event->altKey ? ModifierKeys::altModifier : 0) |
+                    (event->metaKey ? ModifierKeys::commandModifier : 0);
+        ModifierKeys::currentModifiers = ModifierKeys(flags);
+        // Native JUCE reports modifier transitions separately from key presses.
+        // Sending Alt/Shift/Ctrl/Meta as a key press prematurely completes the
+        // shortcut editor's Learn operation before the chord's actual key.
+        const String text = String::fromUTF8(event->key);
+        if (text == "Shift" || text == "Control" || text == "Alt" || text == "Meta" ||
+            text == "AltGraph")
+        {
+            p.handleModifierKeysChange();
+            return false;
+        }
+        p.handleKeyUpOrDown(down);
+        if (down)
+        {
+            const bool handled = p.handleKeyPress(browserKeyCode(code), text.length() == 1 ? text[0] : 0);
+            p.syncInput();
+            return handled;
+        }
+        return false;
+    }
+    static bool wheel(int, const EmscriptenWheelEvent *event, void *ctx)
+    {
+        auto &p = *static_cast<BrowserPeer *>(ctx);
+        // DOM accessibility controls can own keyboard focus while the canvas receives
+        // wheel input, so its current modifier state must come from this event.
+        ModifierKeys::currentModifiers = mouseModifiers(event->mouse);
+        MouseWheelDetails wheel;
+        wheel.deltaX = float(-event->deltaX / 100.0);
+        wheel.deltaY = float(-event->deltaY / 100.0);
+        wheel.isSmooth = event->deltaMode == 0;
+        p.handleMouseWheel(MouseInputSource::InputSourceType::mouse,
+                           {float(event->mouse.targetX), float(event->mouse.targetY)},
+                           int64(Time::getMillisecondCounter()), wheel);
+        return true;
+    }
+
+  public:
+    BrowserPeer(Component &c, int flags)
+        : ComponentPeer(c, flags), canvasId("juce-" + String(inputPeerId))
+    {
+        MAIN_THREAD_EM_ASM(
+            {
+                const c = document.createElement('canvas');
+                c.id = UTF8ToString($0);
+                c.style.zIndex = $3 ? 2000 : 0;
+                if (!$2) c.tabIndex = 0;
+                c.setAttribute('aria-label', UTF8ToString($1));
+                StochasHost.register(c, $3);
+                if (Module.stochasWclap) StochasWclapPage.transferCanvas(c);
+                c.addEventListener('blur', event => { c.stochasFocusDestination=event.relatedTarget?.dataset.jucePeer || ""; }, true);
+                c.addEventListener('contextmenu', e => e.preventDefault());
+                StochasBrowser.attachFileDrop(c, $4);
+                c.addEventListener('pointerdown', e => c.setPointerCapture(e.pointerId));
+                c.addEventListener('pointercancel', e => {
+                    c.dispatchEvent(new MouseEvent('mouseup', {clientX:e.clientX, clientY:e.clientY, buttons:0}));
+                });
+            },
+            canvasId.toRawUTF8(), c.getName().toRawUTF8(), (flags & windowIgnoresKeyPresses) != 0,
+            (flags & windowIsTemporary) != 0, inputPeerId);
+        const auto selector = "#" + canvasId;
+        emscripten_set_mousedown_callback(selector.toRawUTF8(), this, true, mouse);
+        emscripten_set_mouseup_callback(selector.toRawUTF8(), this, true, mouse);
+        emscripten_set_mousemove_callback(selector.toRawUTF8(), this, true, mouse);
+        emscripten_set_keydown_callback(selector.toRawUTF8(), this, true, key);
+        emscripten_set_keyup_callback(selector.toRawUTF8(), this, true, key);
+        emscripten_set_wheel_callback(selector.toRawUTF8(), this, true, wheel);
+        emscripten_set_focus_callback(selector.toRawUTF8(), this, true, focus);
+        emscripten_set_blur_callback(selector.toRawUTF8(), this, true, focus);
+        setBounds(c.getBounds(), false);
+    }
+    ~BrowserPeer() override
+    {
+        finishInputComposition();
+        MAIN_THREAD_EM_ASM({ StochasTextInput.detach($0); }, inputPeerId);
+        const auto selector = "#" + canvasId;
+        emscripten_set_mousedown_callback(selector.toRawUTF8(), nullptr, true, nullptr);
+        emscripten_set_mouseup_callback(selector.toRawUTF8(), nullptr, true, nullptr);
+        emscripten_set_mousemove_callback(selector.toRawUTF8(), nullptr, true, nullptr);
+        emscripten_set_keydown_callback(selector.toRawUTF8(), nullptr, true, nullptr);
+        emscripten_set_keyup_callback(selector.toRawUTF8(), nullptr, true, nullptr);
+        emscripten_set_wheel_callback(selector.toRawUTF8(), nullptr, true, nullptr);
+        emscripten_set_focus_callback(selector.toRawUTF8(), nullptr, true, nullptr);
+        emscripten_set_blur_callback(selector.toRawUTF8(), nullptr, true, nullptr);
+        EM_ASM({ globalThis.StochasWorkerCanvas?.remove(UTF8ToString($0)); }, canvasId.toRawUTF8());
+        MAIN_THREAD_EM_ASM({ StochasHost.unregister(UTF8ToString($0)); }, canvasId.toRawUTF8());
+    }
+    void *getNativeHandle() const override { return const_cast<BrowserPeer *>(this); }
+    void setVisible(bool value) override
+    {
+        visible = value;
+        MAIN_THREAD_EM_ASM(
+            { StochasHost.canvas(UTF8ToString($0)).style.display = $1 ? 'block' : 'none'; },
+            canvasId.toRawUTF8(), value);
+    }
+    void setTitle(const String &title) override
+    {
+        MAIN_THREAD_EM_ASM(
+            {
+                StochasHost.canvas(UTF8ToString($0))
+                    .setAttribute('aria-label', UTF8ToString($1));
+            },
+            canvasId.toRawUTF8(), title.toRawUTF8());
+    }
+    void setBounds(const Rectangle<int> &r, bool fs) override
+    {
+        bounds = r;
+        fullscreen = fs;
+        pixelScale = windowPixelRatio();
+        if (r.getWidth() > 0 && r.getHeight() > 0)
+        {
+            backing = Image(Image::ARGB, int(std::ceil(r.getWidth() * pixelScale)),
+                            int(std::ceil(r.getHeight() * pixelScale)), true);
+            rgba.resize(size_t(backing.getWidth()) * backing.getHeight() * 4);
+        }
+        EM_ASM({ globalThis.StochasWorkerCanvas?.prepare(UTF8ToString($0), $1, $2); },
+               canvasId.toRawUTF8(), backing.getWidth(), backing.getHeight());
+        MAIN_THREAD_EM_ASM(
+            {
+                const c = StochasHost.canvas(UTF8ToString($0));
+                if (!Module.stochasWclap) { c.width = $5; c.height = $6; }
+                c.style.width = $3 + 'px';
+                c.style.height = $4 + 'px';
+                c.style.left = $1 + 'px';
+                c.style.top = $2 + 'px';
+            },
+            canvasId.toRawUTF8(), r.getX(), r.getY(), r.getWidth(), r.getHeight(),
+            backing.getWidth(), backing.getHeight());
+        dirty = repaintAll = true;
+        handleMovedOrResized();
+    }
+    Rectangle<int> getBounds() const override { return bounds; }
+    Point<float> localToGlobal(Point<float> p) override
+    {
+        return p + bounds.getPosition().toFloat();
+    }
+    Point<float> globalToLocal(Point<float> p) override
+    {
+        return p - bounds.getPosition().toFloat();
+    }
+    void setMinimised(bool b) override { setVisible(!b); }
+    bool isMinimised() const override { return !visible; }
+    bool isShowing() const override { return visible; }
+    void setFullScreen(bool b) override { fullscreen = b; }
+    bool isFullScreen() const override { return fullscreen; }
+    void setIcon(const Image &) override {}
+    bool contains(Point<int> p, bool) const override
+    {
+        if (!bounds.withPosition(0, 0).contains(p))
+            return false;
+        return MAIN_THREAD_EM_ASM_INT({
+            const canvas = StochasHost.canvas(UTF8ToString($0));
+            return StochasHost.elementFromPoint($1, $2) === canvas;
+        }, canvasId.toRawUTF8(), p.x + bounds.getX(), p.y + bounds.getY());
+    }
+    OptionalBorderSize getFrameSizeIfPresent() const override
+    {
+        return OptionalBorderSize(BorderSize<int>{});
+    }
+    BorderSize<int> getFrameSize() const override { return {}; }
+    bool setAlwaysOnTop(bool b) override
+    {
+        MAIN_THREAD_EM_ASM(
+            { StochasHost.canvas(UTF8ToString($0)).style.zIndex = $2 ? 2000 : ($1 ? 100 : 0); },
+            canvasId.toRawUTF8(), b, (getStyleFlags() & windowIsTemporary) != 0);
+        return true;
+    }
+    void toFront(bool focus) override
+    {
+        MAIN_THREAD_EM_ASM(
+            {
+                const c = StochasHost.canvas(UTF8ToString($0));
+                c.parentNode.appendChild(c);
+            },
+            canvasId.toRawUTF8());
+        if (focus)
+            grabFocus();
+    }
+    void toBehind(ComponentPeer *) override
+    {
+        MAIN_THREAD_EM_ASM(
+            {
+                const c = StochasHost.canvas(UTF8ToString($0));
+                c.parentNode.prepend(c);
+            },
+            canvasId.toRawUTF8());
+    }
+    String accessibilityCanvasId() const { return canvasId; }
+    bool isFocused() const override
+    {
+        return MAIN_THREAD_EM_ASM_INT(
+            { const active = StochasHost.activeElement();
+              return active === StochasHost.canvas(UTF8ToString($0)) ||
+                       active?.dataset.jucePeer === UTF8ToString($0); },
+            canvasId.toRawUTF8());
+    }
+    void grabFocus() override
+    {
+        if ((getStyleFlags() & windowIgnoresKeyPresses) == 0 && !isFocused())
+            MAIN_THREAD_EM_ASM({ StochasHost.canvas(UTF8ToString($0)).focus(); }, canvasId.toRawUTF8());
+    }
+    void repaint(const Rectangle<int> &area) override
+    {
+        dirtyRegion.add(area);
+        dirty = true;
+    }
+    void performAnyPendingRepaintsNow() override
+    {
+        if (pixelScale != windowPixelRatio())
+            setBounds(bounds, fullscreen);
+        callVBlankListeners(emscripten_get_now() / 1000.);
+        if (dirty || (inputActive && (!isFocused() ||
+            findCurrentTextInputTarget() != dynamic_cast<TextInputTarget *>(inputComponent.getComponent()))))
+            syncInput();
+        if (!dirty || !visible || backing.isNull())
+            return;
+        dirty = false;
+        // Composition underlines are drawn over the whole window: repaint all of it.
+        const auto window = bounds.withZeroOrigin();
+        auto regions = std::move(dirtyRegion);
+        dirtyRegion = {};
+        const bool full = repaintAll || !inputFormats.empty();
+        repaintAll = false;
+        if (full)
+        {
+            paintArea(window);
+            return;
+        }
+        // Separate meter and control invalidations can be far apart. Painting
+        // their bounding box would convert and upload all the pixels between
+        // them. Bound the number of calls when invalidations are fragmented.
+        const auto bounds = regions.getBounds().getIntersection(window);
+        if (bounds.isEmpty()) return;
+        int64 covered = 0;
+        for (const auto &region : regions)
+        {
+            const auto clipped = region.getIntersection(window);
+            covered += int64(clipped.getWidth()) * clipped.getHeight();
+        }
+        if (regions.getNumRectangles() > 8 ||
+            covered * 2 >= int64(bounds.getWidth()) * bounds.getHeight())
+        {
+            paintArea(bounds);
+            return;
+        }
+        for (const auto &region : regions)
+            paintArea(region.getIntersection(window));
+    }
+    void paintArea(const Rectangle<int> &area)
+    {
+        if (area.isEmpty()) return;
+        // The backing pixels that cover the area.
+        const int x0 = std::max(0, int(std::floor(area.getX() * pixelScale)));
+        const int y0 = std::max(0, int(std::floor(area.getY() * pixelScale)));
+        const int x1 = std::min(backing.getWidth(), int(std::ceil(area.getRight() * pixelScale)));
+        const int y1 = std::min(backing.getHeight(), int(std::ceil(area.getBottom() * pixelScale)));
+        if (x1 <= x0 || y1 <= y0)
+            return;
+        const Rectangle<int> pixels(x0, y0, x1 - x0, y1 - y0);
+        backing.clear(pixels);
+        {
+            auto context = backing.createLowLevelContext();
+            context->clipToRectangle(pixels);
+            context->addTransform(AffineTransform::scale(float(pixelScale)));
+            handlePaint(*context);
+        }
+        paintInput();
+        // Premultiplied ARGB to the canvas's straight RGBA, for the area only.
+        Image::BitmapData data(backing, x0, y0, pixels.getWidth(), pixels.getHeight(),
+                               Image::BitmapData::readOnly);
+        rgba.resize(size_t(pixels.getWidth()) * pixels.getHeight() * 4);
+        auto *out = rgba.data();
+        for (int y = 0; y < pixels.getHeight(); ++y)
+        {
+            const auto *line = data.getLinePointer(y);
+            for (int x = 0; x < pixels.getWidth(); ++x, out += 4)
+            {
+                auto pixel = *reinterpret_cast<const PixelARGB *>(line + x * data.pixelStride);
+                pixel.unpremultiply();
+                out[0] = pixel.getRed();
+                out[1] = pixel.getGreen();
+                out[2] = pixel.getBlue();
+                out[3] = pixel.getAlpha();
+            }
+        }
+        EM_ASM(
+            {
+                if (globalThis.StochasWorkerCanvas) {
+                    StochasWorkerCanvas.paint(UTF8ToString($0), $1, $2, $3, $4, $5);
+                } else {
+                    const c = StochasHost.canvas(UTF8ToString($0));
+                    const context = c.stochasContext ||= c.getContext('2d');
+                    const image = c.stochasImage?.width === $3 && c.stochasImage.height === $4
+                        ? c.stochasImage : (c.stochasImage = context.createImageData($3, $4));
+                    image.data.set(HEAPU8.subarray($5, $5 + $3 * $4 * 4));
+                    context.putImageData(image, $1, $2);
+                }
+            },
+            canvasId.toRawUTF8(), x0, y0, pixels.getWidth(), pixels.getHeight(), rgba.data());
+    }
+    void setAlpha(float alpha) override
+    {
+        MAIN_THREAD_EM_ASM(
+            { StochasHost.canvas(UTF8ToString($0)).style.opacity = $1; }, canvasId.toRawUTF8(),
+            alpha);
+    }
+    StringArray getAvailableRenderingEngines() override { return {"JUCE software renderer"}; }
+    void textInputRequired(Point<int>, TextInputTarget &) override { syncInput(); }
+    void dismissPendingTextInput() override { syncInput(); closeInputMethodContext(); }
+#include "BrowserTextInput.inc"
+};
+bool isBrowserCompositionActive(const TextInputTarget *target)
+{
+    return browserCompositionComponent != nullptr && target == browserCompositionTarget &&
+           target == dynamic_cast<TextInputTarget *>(browserCompositionComponent.getComponent());
+}
+extern "C" STOCHAS_BROWSER_EXPORT int stochas_browser_file_drop(int id, const char *paths, int x, int y)
+{
+    auto *peer = BrowserPeer::inputPeer(id);
+    if (!peer || !peer->getComponent().isShowing()) return 0;
+    const auto parsed = JSON::parse(String::fromUTF8(paths));
+    const auto *items = parsed.getArray();
+    if (!items || items->isEmpty()) return 0;
+    ComponentPeer::DragInfo info;
+    for (const auto &item : *items)
+    {
+        if (!item.isString()) return 0;
+        info.files.add(item.toString());
+    }
+    info.position = {x, y};
+    return peer->handleDragDrop(info) ? 1 : 0;
+}
+// The application's container moved or the viewport changed (Web Audio Module GUI).
+extern "C" STOCHAS_BROWSER_EXPORT void stochas_browser_displays_changed()
+{
+    const_cast<Displays &>(Desktop::getInstance().getDisplays()).refresh();
+}
+extern "C" STOCHAS_BROWSER_EXPORT void stochas_text_update(int id, int generation, int start, int end, char *data, int a, int b)
+{
+    const auto text = String::fromUTF8(data);
+    std::free(data);
+    if (auto *peer = BrowserPeer::inputPeer(id)) peer->updateInput(generation,start,end,text,a,b);
+}
+extern "C" STOCHAS_BROWSER_EXPORT void stochas_text_composition(int id, int generation, int begin)
+{
+    if (auto *peer = BrowserPeer::inputPeer(id)) peer->compositionInput(generation,begin != 0);
+}
+extern "C" STOCHAS_BROWSER_EXPORT const char *stochas_text_bounds(int id, int generation, int index)
+{
+    static String bounds;
+    bounds = "[0,0,0,0]";
+    if (auto *peer = BrowserPeer::inputPeer(id)) bounds = peer->characterInputBounds(generation,index);
+    return bounds.toRawUTF8();
+}
+extern "C" STOCHAS_BROWSER_EXPORT void stochas_text_format(int id, int generation, int start, int end, int style, int thickness)
+{
+    if (auto *peer = BrowserPeer::inputPeer(id)) peer->formatInput(generation,start,end,style,thickness);
+}
+#include "BrowserAccessibility.inc"
+ComponentPeer *Component::createNewPeer(int flags, void *) { return new BrowserPeer(*this, flags); }
+bool Desktop::canUseSemiTransparentWindows() noexcept { return true; }
+double Desktop::getDefaultMasterScale() { return 1.; }
+Desktop::DisplayOrientation Desktop::getCurrentOrientation() const { return upright; }
+void Desktop::allowedOrientationsChanged() {}
+void Desktop::setScreenSaverEnabled(bool) {}
+bool Desktop::isScreenSaverEnabled() { return true; }
+void Desktop::setKioskComponent(Component *c, bool enabled, bool)
+{
+    if (c && c->getPeer())
+        c->getPeer()->setFullScreen(enabled);
+}
+class Desktop::NativeDarkModeChangeDetectorImpl
+{
+};
+std::unique_ptr<Desktop::NativeDarkModeChangeDetectorImpl>
+Desktop::createNativeDarkModeChangeDetectorImpl()
+{
+    return {};
+}
+bool Desktop::isDarkModeActive() const
+{
+    return MAIN_THREAD_EM_ASM_INT({ return matchMedia('(prefers-color-scheme: dark)').matches; });
+}
+bool detail::MouseInputSourceList::addSource()
+{
+    if (!sources.isEmpty())
+        return false;
+    addSource(0, MouseInputSource::InputSourceType::mouse);
+    return true;
+}
+bool detail::MouseInputSourceList::canUseTouch() const { return false; }
+Point<float> MouseInputSource::getCurrentRawMousePosition() { return browserMouse; }
+void MouseInputSource::setRawMousePosition(Point<float>) {}
+bool KeyPress::isKeyCurrentlyDown(int key)
+{
+    // browserKeys holds translated codes (browserKeyCode).
+    if (key >= 'a' && key <= 'z')
+        key -= 'a' - 'A';
+    return browserKeys.count(key) != 0;
+}
+void Displays::findDisplays(float masterScale)
+{
+    Display d;
+    d.isMain = true;
+    d.scale = masterScale;
+    d.dpi = 96;
+    // The visible viewport, in container-relative desktop coordinates.
+    d.totalArea = {MAIN_THREAD_EM_ASM_INT({ return StochasHost.displayArea()[0]; }), MAIN_THREAD_EM_ASM_INT({ return StochasHost.displayArea()[1]; }),
+                   MAIN_THREAD_EM_ASM_INT({ return StochasHost.displayArea()[2]; }), MAIN_THREAD_EM_ASM_INT({ return StochasHost.displayArea()[3]; })};
+    d.userArea = d.totalArea;
+    displays.add(d);
+}
+bool WindowUtils::areThereAnyAlwaysOnTopWindows() { return false; }
+bool Process::isForegroundProcess()
+{
+    return MAIN_THREAD_EM_ASM_INT({ return document.hasFocus(); });
+}
+void Process::makeForegroundProcess() {}
+void Process::hide() {}
+void LookAndFeel::playAlertSound() {}
+struct MouseCursor::PlatformSpecificHandle
+{
+    explicit PlatformSpecificHandle(StandardCursorType t) : type(t) {}
+    explicit PlatformSpecificHandle(const detail::CustomMouseCursorInfo &) : type(NormalCursor) {}
+    StandardCursorType type;
+    static void showInWindow(PlatformSpecificHandle *handle, ComponentPeer *)
+    {
+        const auto type = handle ? handle->type : NormalCursor;
+        const char *css = type == NoCursor             ? "none"
+                          : type == IBeamCursor        ? "text"
+                          : type == PointingHandCursor ? "pointer"
+                          : type == DraggingHandCursor ? "grabbing"
+                                                       : "default";
+        MAIN_THREAD_EM_ASM({ StochasHost.container().style.cursor = UTF8ToString($0); }, css);
+    }
+};
+namespace
+{
+using ClipboardCallback = std::function<void(bool, const String &)>;
+std::map<unsigned, ClipboardCallback> clipboardRequests;
+unsigned clipboardRequestId = 0;
+void requestClipboard(bool write, const String &text, ClipboardCallback callback)
+{
+    if (clipboardRequests.size() >= 32)
+    {
+        SystemClipboard::reportClipboardError("Too many pending clipboard requests. Try again.");
+        callback(false, {});
+        return;
+    }
+    do { ++clipboardRequestId; } while (clipboardRequests.count(clipboardRequestId));
+    clipboardRequests.emplace(clipboardRequestId, std::move(callback));
+    MAIN_THREAD_EM_ASM({
+        const id = $0;
+        StochasClipboard.run(id, $1, UTF8ToString($2), (ok, value) => {
+            const pointer = stringToNewUTF8(value);
+            _stochas_clipboard_complete(id, ok, pointer);
+        });
+    }, clipboardRequestId, write, text.toRawUTF8());
+}
+}
+extern "C" STOCHAS_BROWSER_EXPORT void stochas_clipboard_complete(unsigned id, int ok, const char *text)
+{
+    const auto value = String::fromUTF8(text);
+    std::free(const_cast<char *>(text));
+    auto found = clipboardRequests.find(id);
+    if (found == clipboardRequests.end()) return;
+    auto callback = std::move(found->second);
+    clipboardRequests.erase(found);
+    callback(ok != 0, value);
+}
+void SystemClipboard::readTextAsync(std::function<void(bool, const String &)> callback)
+{
+    requestClipboard(false, {}, std::move(callback));
+}
+void SystemClipboard::writeTextAsync(const String &text, std::function<void(bool)> callback)
+{
+    requestClipboard(true, text, [callback = std::move(callback)](bool ok, const String &) { callback(ok); });
+}
+void SystemClipboard::reportClipboardError(const String &message)
+{
+    MAIN_THREAD_EM_ASM({ StochasClipboard.report(UTF8ToString($0)); }, message.toRawUTF8());
+}
+void SystemClipboard::copyTextToClipboard(const String &text)
+{
+    writeTextAsync(text, [](bool) {});
+}
+// Chrome exposes no synchronous clipboard read. All JUCE text/code editor
+// consumers are adapted to readTextAsync in the checked build-local overlay.
+String SystemClipboard::getTextFromClipboard() { return {}; }
+bool DragAndDropContainer::performExternalDragDropOfFiles(const StringArray &, bool, Component *,
+                                                          std::function<void()>)
+{
+    return false;
+}
+bool DragAndDropContainer::performExternalDragDropOfText(const String &, Component *,
+                                                         std::function<void()>)
+{
+    return false;
+}
+} // namespace juce
+#include "juce_gui_basics/native/juce_NativeMessageBox_linux.cpp"
+
+#include "BrowserKeys.h"
+namespace juce::detail
+{
+Image WindowingHelpers::createIconForFile(const File &) { return {}; }
+} // namespace juce::detail
+
+// clang-format on
+
+#include "BrowserFileChooser.cpp"

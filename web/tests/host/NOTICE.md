@@ -1,0 +1,1 @@
+Thin CLAP/WASI test-host bindings from public Surge fork commit 8def5147f58d4b22dfee91b8aa72611412339273, GPL-3.0-or-later. The only initial adaptation permits zero audio buses in the returned test record. These bindings do not implement sequencing or DSP.
