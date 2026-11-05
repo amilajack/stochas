@@ -9,6 +9,7 @@ import gzip
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import tarfile
@@ -59,9 +60,15 @@ def main():
             raise ValueError('source symlink needs explicit packaging review: ' + name)
         if path.is_file():
             sources['stochas-source/' + name] = path
-    source_hashes = {name: sha(path.read_bytes()) for name, path in sources.items()}
-    source_digest = sha(json.dumps(source_hashes, sort_keys=True, separators=(',', ':')).encode())
     source_revision = git('rev-parse', 'HEAD').decode().strip()
+    epoch = os.environ.get('SOURCE_DATE_EPOCH') or git('show', '-s', '--format=%ct', 'HEAD').decode().strip()
+    if not epoch.isdecimal():
+        raise ValueError('SOURCE_DATE_EPOCH must be a nonnegative integer')
+    sources['stochas-source/web/source-version.json'] = json.dumps(
+        dict(schema=1, revision=source_revision, epoch=int(epoch)), sort_keys=True).encode() + b'\n'
+    source_hashes = {name: sha(path if isinstance(path, bytes) else path.read_bytes())
+                     for name, path in sources.items()}
+    source_digest = sha(json.dumps(source_hashes, sort_keys=True, separators=(',', ':')).encode())
     source_metadata = json.dumps(dict(commit=source_revision, uncommitted=dirty,
                                      treeDigest=source_digest, files=source_hashes),
                                  sort_keys=True, indent=2).encode() + b'\n'
@@ -76,6 +83,10 @@ def main():
                      'ui/stochas-ui.data', 'ui/support.js'):
         if required not in files:
             raise ValueError('missing original editor output: ' + required)
+    if not dirty:
+        for name in ('module.wasm', 'ui/stochas-ui.wasm'):
+            if source_revision.encode() not in files[name].read_bytes():
+                raise ValueError('rebuild from the current committed source before packaging: ' + name)
     notices = {'COPYING': ROOT / 'COPYING', 'JUCE-LICENSE.md': ROOT / 'lib/JUCE/LICENSE.md',
                'JUCE-PORT-NOTICE.md': ROOT / 'web/JUCE-PORT-NOTICE.md',
                'WEBVIEW-LICENSE': ROOT / 'web/vendor/clap-webview/LICENSE',
@@ -84,6 +95,7 @@ def main():
     files.update({'notices/' + name: path for name, path in notices.items()})
     manifest = dict(id='org.surge-synth-team.stochas', license='AGPL-3.0-only',
                     sourceCommit=source_revision, sourceTreeDigest=source_digest,
+                    sourceDateEpoch=int(epoch),
                     uncommitted=dirty, dependencies=submodules,
                     files={name: dict(bytes=path.stat().st_size, sha256=sha(path.read_bytes()))
                            for name, path in sorted(files.items())})
