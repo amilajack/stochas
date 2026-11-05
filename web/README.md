@@ -79,9 +79,13 @@ functional state equality alone does not establish dropout safety.
 
 ## Licensing and provenance
 
-See `JUCE-PORT-NOTICE.md`, the original `COPYING`, JUCE's license, the vendored
+See `JUCE-PORT-NOTICE.md`, the original `COPYING`, the full `licenses/AGPL-3.0.txt`
+terms, JUCE's license, the vendored
 webview header notice, and the bundled fonts' OFL notices. The combined browser
 build includes JUCE under AGPL-3.0-only; original Stochas remains GPL-3.0-only.
+The AGPL terms are the verbatim GNU text from
+`https://www.gnu.org/licenses/agpl-3.0.txt`. Both the source and binary archives
+include this license copy alongside the original GPL and dependency notices.
 Distribute complete corresponding source, pinned dependency sources, notices,
 and build instructions with binary archives. Do not ship private host fixtures
 or task profiles as plug-in source.

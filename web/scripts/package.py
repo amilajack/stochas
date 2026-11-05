@@ -87,7 +87,7 @@ def main():
         for name in ('module.wasm', 'ui/stochas-ui.wasm'):
             if source_revision.encode() not in files[name].read_bytes():
                 raise ValueError('rebuild from the current committed source before packaging: ' + name)
-    notices = {'COPYING': ROOT / 'COPYING', 'JUCE-LICENSE.md': ROOT / 'lib/JUCE/LICENSE.md',
+    notices = {'COPYING': ROOT / 'COPYING', 'AGPL-3.0.txt': ROOT / 'web/licenses/AGPL-3.0.txt', 'JUCE-LICENSE.md': ROOT / 'lib/JUCE/LICENSE.md',
                'JUCE-PORT-NOTICE.md': ROOT / 'web/JUCE-PORT-NOTICE.md',
                'WEBVIEW-LICENSE': ROOT / 'web/vendor/clap-webview/LICENSE',
                'Lato-OFL.txt': ROOT / 'web/fonts/OFL.txt',
