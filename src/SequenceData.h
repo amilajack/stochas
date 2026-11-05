@@ -27,18 +27,22 @@ Do not add pointers to any of these!
 class SequenceData;
 
 // this was gotten and modified from the example on juce.com
-#define FIFO_SIZE 16
-class SeqFifo
+#define FIFO_SIZE 257 //256 admitted commands plus the ring's reserved slot
+template<int Capacity> class SeqPreparedFifo
 {
 public:
    struct DataMember {
       int value1;
       int value2;
       int value3;
+      uint32_t generation;
    };
-   SeqFifo() : abstractFifo(FIFO_SIZE) {}
+   SeqPreparedFifo() : abstractFifo(Capacity) { static_assert(Capacity>1); }
    // add a piece of data to the fifo, return true if success
    bool addToFifo(int value1, int value2, int value3) {
+      return addToFifoTagged(mGeneration.get(),value1,value2,value3);
+   }
+   bool addToFifoTagged(uint32_t generation,int value1,int value2,int value3) {
       bool ret = false;
       int start1, size1, start2, size2;
       abstractFifo.prepareToWrite(1, start1, size1, start2, size2);
@@ -48,39 +52,67 @@ public:
          myBuffer[start1].value1 = value1;
          myBuffer[start1].value2 = value2;
          myBuffer[start1].value3 = value3;
+         myBuffer[start1].generation = generation;
       }
       abstractFifo.finishedWrite(size1 + size2);
+      if(!ret)mOverflow.set(1);
       return ret;
    }
    // read a piece of data from fifo, return true if success
    bool readFromFifo(int *value1, int *value2, int *value3)
    {
-      bool ret = false;
-      int start1, size1, start2, size2;
-      abstractFifo.prepareToRead(1, start1, size1, start2, size2);
-      if (size1 > 0) {
-         *value1 = myBuffer[start1].value1;
-         *value2 = myBuffer[start1].value2;
-         *value3 = myBuffer[start1].value3;
-         ret = true;
+      for (int budget = 0; budget < Capacity; ++budget) {
+         int start1, size1, start2, size2;
+         abstractFifo.prepareToRead(1, start1, size1, start2, size2);
+         if (size1 == 0) return false;
+         const auto item = myBuffer[start1];
+         abstractFifo.finishedRead(size1 + size2);
+         if (item.generation != mGeneration.get()) continue;
+         *value1 = item.value1; *value2 = item.value2; *value3 = item.value3;
+         return true;
       }
-      abstractFifo.finishedRead(size1 + size2);
-      return ret;
+      return false;
    }
+
+   // Consumer-side reset does not race the producer's write index. A producer
+   // already preparing an old command tags it with the old generation, so even
+   // a late publication cannot resurrect a pre-reset UI note-on.
+   void discardPending()
+   {
+      const uint32_t generation = invalidateGeneration();
+      for (int budget = 0; budget < Capacity; ++budget) {
+         int start1, size1, start2, size2;
+         abstractFifo.prepareToRead(1, start1, size1, start2, size2);
+         if (size1 == 0 || myBuffer[start1].generation == generation) return;
+         abstractFifo.finishedRead(size1 + size2);
+      }
+   }
+   int freeSpace() const { return abstractFifo.getFreeSpace(); }
+   int readyCount() const { return abstractFifo.getNumReady(); }
+   uint32_t generation() const { return mGeneration.get(); }
+   uint32_t invalidateGeneration() { return ++mGeneration; }
+   bool consumeOverflow() noexcept { return mOverflow.exchange(0)!=0; }
 
    void clearFifo()
    {
       abstractFifo.reset();
    }
 private:
+   juce::Atomic<uint32_t> mGeneration{0};
+   juce::Atomic<int> mOverflow{0};
    AbstractFifo abstractFifo;
-   DataMember myBuffer[FIFO_SIZE];
+   DataMember myBuffer[Capacity];
 };
+using SeqFifo = SeqPreparedFifo<FIFO_SIZE>;
 
 /* The info in this struct is specific to each layer. 
 */
 class SequenceLayer {
    friend class SequenceData;
+   friend class SeqPersist;
+   friend class SeqWireDelta;
+   friend class StochasCompactStatePrototype;
+   friend class SeqCompactState;
 
    // single cell of data
    struct Cell {
@@ -142,9 +174,9 @@ class SequenceLayer {
    // in the case of custom
    struct Note {
       int8_t note;
-      char noteName[SEQ_MAX_NOTELABEL_LEN];
+      char noteName[SEQ_MAX_NOTELABEL_LEN + 1];
       Note() : note(0) {
-         memset(noteName, 0, SEQ_MAX_NOTELABEL_LEN);
+         memset(noteName, 0, sizeof(noteName));
       }
    };
 
@@ -451,6 +483,9 @@ extern SeqMidiMapItem gDefaultMidiMapItems[];
 
 */
 class SequenceData {
+   friend class SeqWireDelta;
+   friend class StochasCompactStatePrototype;
+   friend class SeqCompactState;
 
    SequenceLayer mLayers[SEQ_MAX_LAYERS];
 
@@ -577,16 +612,29 @@ typedef void(*ChangeCallback)(void *);
 /** This is to swap out buffers so that we can modify the sequence data
     from the UI thread, then swap it into the audio thread
 */
+#include "PreparedTripleBuffer.h"
 class SeqDataBuffer {
-   Atomic<int> mCurrent; // which one the audio thread is looking at
-   SequenceData mBuffer[2]; // double buffer
+   PreparedTripleBufferSlots mSlots;
+   SequenceData mBuffer[3];
+   uint64_t mMappingRevision[3]{};
+   uint64_t mNextMappingRevision = 0; // control writer only
+   uint64_t mStateRevision[3]{};
+   uint64_t mNextStateRevision = 0;
+   uint64_t mControlRevision = 0;
    ChangeCallback mCB;
    void *mCBHandle;
    SequenceData mUndoBuffer;
 public:
-   SeqDataBuffer() : mCurrent(0), mCB(0) , mCBHandle(0) {}
+   SeqDataBuffer() : mCB(0) , mCBHandle(0) {}
+   // Exactly once at the start of processBlock. Constant-time ownership
+   // exchange; the callback never copies or mutates sequence payloads.
+   bool beginAudioBlock() noexcept { return mSlots.consume(); }
    // called from UI thread (only) to point audio thread to new buffer
-   void swap();
+   void swap(bool refreshMappings = false);
+   uint64_t getAudioMappingRevision() const noexcept { return mMappingRevision[mSlots.readerSlot()]; }
+   uint64_t getAudioStateRevision() const noexcept { return mStateRevision[mSlots.readerSlot()]; }
+   uint64_t getControlRevision() const noexcept { return mControlRevision; }
+   uint64_t getControlStateRevision() const noexcept { return mNextStateRevision; }
 
    // this copies undo buffer to ui side and implicitly does a swap
    void undo();
@@ -599,15 +647,18 @@ public:
    // will return the same physical object (ie, don't call it multiple times in a function
    // and don't store the value beyond a function)
    SequenceData *getAudSeqData() {
-      return &mBuffer[mCurrent.get()];
+      return &mBuffer[mSlots.readerSlot()];
    }
 
    // called from UI thread when it needs to get current data.
    // it may alter the data, and then call swap when it wants
    // to make that available to the audio thread
    SequenceData *getUISeqData() {
-      return &mBuffer[mCurrent.get() ? 0 : 1];
+      return &mBuffer[mSlots.writerSlot()];
    }
+   // Control thread only: latest committed edit even before the next callback.
+   SequenceData *getPublishedSeqData() { return &mBuffer[mSlots.publishedSlot()]; }
+   uint64_t getPublishedStateRevision() const { return mStateRevision[mSlots.publishedSlot()]; }
 };
 
 /* used only so that seqprocessornotifier can get access to 
@@ -640,7 +691,10 @@ class SeqProcessorNotifier {
 
    //This is for passing complete midi notes (note, step position, velocity, length) 
    // to the UI thread so that it can add them to the SequenceData
-   SeqFifo mCompletedNoteFifo;
+   // A full admitted1024-event input batch can complete notes before the next
+   // editor tick. JUCE's ring leaves one slot unused.
+   SeqPreparedFifo<1025> mCompletedNoteFifo;
+   uint32_t mRecordingGeneration = 0; // audio producer's block-start epoch
 public:
    SeqProcessorNotifier(SeqProcessorNotifierHelper *hlpr);   
    //
@@ -665,6 +719,9 @@ public:
    // clear all recorded notes. call this when recording starts
    // to make sure no old notes are left in the buffer
    void clearCompletedMidiNotes();
+   void beginAudioBlock() noexcept { mRecordingGeneration=mCompletedNoteFifo.generation(); }
+   void invalidateRecordedNotes() noexcept { mCompletedNoteFifo.invalidateGeneration(); }
+   bool hasCompletedMidiNotes() const noexcept { return mCompletedNoteFifo.readyCount()!=0; }
 
    //  UI asks if he should be updated?
    // calling this inherently resets the flag to false
@@ -722,7 +779,7 @@ public:
    void setRandomSeed(int64 seed);
    
    // The processor will send completed notes as they are received
-   void addCompletedMidiNote(int number, int velocity, 
+   bool addCompletedMidiNote(int number, int velocity,
       int len /*in steps*/, int pos /*on the grid*/);
 
    void setRecordingState(PlayRecordState state);

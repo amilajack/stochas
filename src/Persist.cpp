@@ -10,6 +10,9 @@
 
 #include "Persist.h"
 #include "Constants.h"
+#include <algorithm>
+#include <array>
+#include <tuple>
 
 XmlElement * SeqPersist::addKeyVal(const char *name, const String & value)
 {
@@ -133,6 +136,13 @@ void SeqPersist::retrieveLayer(XmlElement * e, SequenceLayer * lay)
    int idx;
    sval = e->getStringAttribute("name");
    lay->setLayerName(sval.getCharPointer());
+   // Scale selection rebuilds the standard note set. Initialize it before
+   // applying explicit persisted pitches, independent of XML child order.
+   if (auto *scaleInfo = e->getChildByName("sko")) {
+      const String scale = scaleInfo->getStringAttribute("stdscale");
+      const String key = scaleInfo->getStringAttribute("stdkey");
+      lay->setKeyScaleOct(scale.getCharPointer(),key.getCharPointer(),scaleInfo->getIntAttribute("stdoct"));
+   }
    for (auto* ch : e->getChildIterator()) {
       if (ch->hasTagName("humlen")) {
          if (getKeyVal(ch, &ival))
@@ -211,21 +221,17 @@ void SeqPersist::retrieveLayer(XmlElement * e, SequenceLayer * lay)
          }
       }
       else if (ch->hasTagName("pats")) {
-         for (auto* pat : ch->getChildWithTagNameIterator("p")) {
-            retrievePattern(pat, lay);
-         }
-      }
-      else if (ch->hasTagName("sko")) {
-         String scale = ch->getStringAttribute("stdscale");
-         String key = ch->getStringAttribute("stdkey");
-         int oct = ch->getIntAttribute("stdoct");
-         lay->setKeyScaleOct(scale.getCharPointer(), key.getCharPointer(), oct);
+         // Apply structural settings first. setNumSteps normalises existing
+         // cells, but explicit saved lengths must survive reload unchanged.
       }
       else if (ch->hasTagName("curpat")) {
         if (getKeyVal(ch, &ival))
           lay->setCurrentPattern(ival);
       }
    }
+   if (auto *patterns = e->getChildByName("pats"))
+      for (auto *pattern : patterns->getChildWithTagNameIterator("p"))
+         retrievePattern(pattern, lay);
 }
 
 void SeqPersist::storeNote(int idx, SequenceLayer * item, XmlElement * parent)
@@ -288,6 +294,14 @@ void SeqPersist::retrievePattern(XmlElement * e, SequenceLayer * lay)
 
 void SeqPersist::storePattern(int idx, SequenceLayer * item, XmlElement * parent)
 {
+   // Chain pools belong to columns, rather than cells. Summarise them once so
+   // disabled chain targets survive saving without a pool scan for every cell.
+   static_assert(SEQ_MAX_STEPS <= 64, "chain summary must cover every step");
+   uint64_t chainColumns[SEQ_MAX_ROWS]{};
+   for (int column = 0; column < SEQ_MAX_STEPS; ++column)
+      for (const auto &link : item->mPats[idx].mChains[column].cells)
+         if (link.flags & SEQ_CHAIN_FLAG_USED)
+            chainColumns[link.targetrow] |= uint64_t{1} << column;
    bool haveRows = false;
    // only store pattern if it has chains and rows
    XmlElement *p = new XmlElement("p");
@@ -303,7 +317,7 @@ void SeqPersist::storePattern(int idx, SequenceLayer * item, XmlElement * parent
    XmlElement *elem = new XmlElement("rows");
    p->prependChildElement(elem);
    for (int i = SEQ_MAX_ROWS-1; i>=0 ; i--) {
-      if (storeRow(i, idx, item, elem))
+      if (storeRow(i, idx, item, elem, chainColumns[i]))
          haveRows = true;
    }   
 
@@ -313,7 +327,7 @@ void SeqPersist::storePattern(int idx, SequenceLayer * item, XmlElement * parent
       delete p;
 }
 
-bool SeqPersist::storeRow(int idx, int pat, SequenceLayer * item, XmlElement * parent)
+bool SeqPersist::storeRow(int idx, int pat, SequenceLayer * item, XmlElement * parent, uint64_t chainColumns)
 {
    XmlElement *r = new XmlElement("r");
    bool haveRow = false;
@@ -321,7 +335,7 @@ bool SeqPersist::storeRow(int idx, int pat, SequenceLayer * item, XmlElement * p
    XmlElement *elem = new XmlElement("cells");
    r->prependChildElement(elem);
    for (int i = SEQ_MAX_STEPS-1; i >=0; i--) {
-      if (storeCell(i,pat,idx, item, elem))
+      if (storeCell(i,pat,idx, item, elem, (chainColumns & (uint64_t{1} << i)) != 0))
          haveRow = true;
    }
 
@@ -336,12 +350,14 @@ bool SeqPersist::storeRow(int idx, int pat, SequenceLayer * item, XmlElement * p
    }
 }
 
-bool SeqPersist::storeCell(int idx, int pat, int row,  SequenceLayer * item, XmlElement * parent)
+bool SeqPersist::storeCell(int idx, int pat, int row,  SequenceLayer * item, XmlElement * parent, bool hasChain)
 {
    int it, srcRow, srcCol;
    bool negtgt, negsrc;
    XmlElement *r;
-   if (item->getProb(row, idx, pat) != SEQ_PROB_OFF) {
+   if (item->getProb(row, idx, pat) != SEQ_PROB_OFF ||
+       item->getVel(row, idx, pat) != 0 || item->getLength(row, idx, pat) != 0 ||
+       item->getOffset(row, idx, pat) != 0 || hasChain) {
       r = new XmlElement("c");
       parent->prependChildElement(r);
       r->setAttribute("idx", idx);
@@ -351,14 +367,26 @@ bool SeqPersist::storeCell(int idx, int pat, int row,  SequenceLayer * item, Xml
       r->setAttribute("offs", item->getOffset(row, idx, pat));
 
       // store chain for this cell
+      struct Link { int row, column; bool negativeTarget, negativeSource; };
+      std::array<Link, SEQ_MAX_CHAIN_SOURCES> links;
+      size_t count = 0;
       it = -1;
-      while (item->getChainSource(row, idx, &it, &srcRow, &srcCol, &negtgt, &negsrc, pat)) {
+      while (hasChain && item->getChainSource(row, idx, &it, &srcRow, &srcCol, &negtgt, &negsrc, pat))
+         links[count++] = {srcRow, srcCol, negtgt, negsrc};
+      std::sort(links.begin(), links.begin() + count, [](const Link &a, const Link &b) {
+         return std::tie(a.row, a.column, a.negativeTarget, a.negativeSource) <
+                std::tie(b.row, b.column, b.negativeTarget, b.negativeSource);
+      });
+      // Prepending in reverse leaves a canonical order independent of the
+      // model's reusable chain-pool slots and XML load insertion order.
+      while (count) {
+         const auto &link = links[--count];
          XmlElement *cs = new XmlElement("cs");
          r->prependChildElement(cs);
-         cs->setAttribute("row", srcRow);
-         cs->setAttribute("col", srcCol);
-         cs->setAttribute("neg", negtgt ? 1 : 0);
-         cs->setAttribute("negsrc", negsrc ? 1 : 0);
+         cs->setAttribute("row", link.row);
+         cs->setAttribute("col", link.column);
+         cs->setAttribute("neg", link.negativeTarget ? 1 : 0);
+         cs->setAttribute("negsrc", link.negativeSource ? 1 : 0);
       }
 
       return true;
@@ -427,6 +455,7 @@ bool SeqPersist::retrieve(SequenceData * targetData, const XmlElement * sourceDa
    int idx;
    int64 val;
    double dval;
+   if (!validate(sourceData)) return false;
    /// read source data into target data
    if (sourceData->getTagName().compare("stochas") != 0) 
       return false;
@@ -451,6 +480,7 @@ bool SeqPersist::retrieve(SequenceData * targetData, const XmlElement * sourceDa
       } // end groove
 
       else if (e->hasTagName("midimap")) {
+         targetData->clearMapping();
          int mapcount = 0;
          for(auto *m : e->getChildIterator()) {
             if (m->hasTagName("mm")) {
@@ -481,7 +511,7 @@ bool SeqPersist::retrieve(SequenceData * targetData, const XmlElement * sourceDa
                         mm->mValue = SEQMIDI_VALUE_TRANS_PREV_NEW;
                   }
 
-                  mapcount++;
+                  mapcount = jmax(mapcount,idx + 1);
                }
             }
          }

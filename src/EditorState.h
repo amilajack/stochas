@@ -85,7 +85,7 @@ public:
    // if next is false it cycles backwards
    int8_t probCycleNext(int8_t curprob, bool mono, bool next=true);
 
-   int getCurrentLayer() { return mCurrentLayer; }
+   int getCurrentLayer() { return mCurrentLayer.get(); }
    void setCurrentLayer(int lay) {
       jassert(lay >= 0 && lay < SEQ_MAX_LAYERS);
       mCurrentLayer = lay;
@@ -163,7 +163,12 @@ public:
 
 private:
    // read or write settings to the config file
-   void configSerialization(bool read);
+   bool configSerialization(bool read);
+public:
+   // Browser editor workers can be terminated without a C++ destructor.
+   // Persist changed preferences explicitly on their control thread.
+   bool saveSettings() { return configSerialization(false); }
+private:
    // read/write individual int setting (min max ensure that values read from file are not out of range)
    // def is default value
    void configGetSetInt(juce::PropertiesFile *pf, bool read, int &val, 
@@ -189,7 +194,7 @@ private:
    String mDefaultFileDir;
 
    EditMode mEditMode;   
-   int mCurrentLayer;
+   Atomic<int> mCurrentLayer{0};
    int mVisibleStep;
    bool mSelectedCells;
    int mSelectedLowRow;
@@ -197,7 +202,7 @@ private:
    int mSelectedLowCol;
    int mSelectedHighCol;
    int mKeyboardDisabled;
-   int mPPQOffset;
+   Atomic<int> mPPQOffset{0};
    int mScaleFactor;
    int mPatLayerLinked;
    int mShowMidiNumbers;

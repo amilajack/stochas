@@ -10,7 +10,9 @@
 
 #include "StandaloneSettings.h"
 #include <JuceHeader.h>
+#if !JUCE_WASM
 #include <juce_audio_plugin_client/Standalone/juce_StandaloneFilterWindow.h>
+#endif
 
 #include <atomic>
 
@@ -24,8 +26,14 @@ namespace
 
    PropertySet *getSettings()
    {
+#if JUCE_WASM
+      // The browser editor and WCLAP are plug-in instances, never the native
+      // standalone application. They must not create an audio-device owner.
+      return nullptr;
+#else
       auto *holder = StandalonePluginHolder::getInstance();
       return holder != nullptr ? holder->settings.get() : nullptr;
+#endif
    }
 }
 

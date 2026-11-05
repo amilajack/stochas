@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stochas</title>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<style>
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#141518;color:#d6d6d6;font:13px system-ui,-apple-system,"Segoe UI",sans-serif}
+canvas{position:absolute;touch-action:none}
+#wclap-status{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:10px;z-index:2000;background:#141518}
+#wclap-status[hidden]{display:none}
+#wclap-status progress{width:220px;accent-color:#ff9000}
+#file-status,#storage-status{position:fixed;left:8px;bottom:8px;z-index:1000;max-width:60%;background:#202328e6;padding:4px 8px;border-radius:3px}
+#storage-status{bottom:40px}
+#file-status:empty,#storage-status:empty{display:none}
+#retry-storage{position:fixed;left:8px;bottom:72px;z-index:1000}
+</style>
+</head>
+<body>
+<div id="wclap-status" role="status"><span id="wclap-message">Loading Stochas…</span><progress id="wclap-progress" max="3" value="0"></progress></div>
+<div id="file-status" role="status"></div>
+<div id="storage-status" role="alert"></div>
+<button id="retry-storage" hidden onclick="StochasBrowser.flush().catch(()=>{})">Retry saving</button>
+<script>
+// The Stochas WCLAP's clap.webview/3 page. It talks to the plug-in only by
+// posting ArrayBuffers to window.parent and receiving them as messages.
+// Everything it loads is fetched relative to this page, so it works where a host
+// serves the bundle at a URL and where it answers fetch() from get_resource
+// (a sandboxed srcdoc frame with an opaque origin and no network).
+// The editor uses threads: the frame needs cross-origin isolation.
+//
+// The existing host storage bridge provides IndexedDB to opaque-origin pages.
+// IDBFS/preset/preferences work stays in this editor, outside the DSP executor.
+(() => {
+  'use strict';
+  const base = new URL('./', document.baseURI);
+  const status = document.getElementById('wclap-status');
+  const message = document.getElementById('wclap-message');
+  const progress = document.getElementById('wclap-progress');
+  const fail = error => {
+    message.textContent = 'Stochas editor stopped: ' + String(error && error.message || error) +
+      '. Close and reopen the editor to retry; audio remains available.';
+    progress.hidden = true;
+    status.hidden = false;
+    for (const waiting of calls.values()) waiting.reject(error);
+    calls.clear();
+    pending.length = 0;
+    pendingBytes = 0;
+    stopped = true;
+  };
+  const pending = [];
+  const calls = new Map();
+  let nextCall = 0;
+  let receiving = false, outstanding = false, pendingBytes = 0, stopped = false;
+  const deliver = () => {
+    if (!receiving || outstanding || stopped || !pending.length) return;
+    const buffer = pending.shift();
+    pendingBytes -= buffer.byteLength;
+    outstanding = true;
+    globalThis.StochasWclapPage.worker.postMessage({stochasMessage: buffer}, [buffer]);
+  };
+  const enqueue = buffer => {
+    if (stopped) return;
+    const type = new Uint8Array(buffer, 0, 1)[0];
+    // Meters and scope samples are replaceable; state, parameters and file
+    // replies must keep their order. Never build a frame backlog on the page.
+    if (type === 65 || type === 66) {
+      const index = pending.findLastIndex(item => new Uint8Array(item, 0, 1)[0] === type);
+      if (index >= 0) {
+        pendingBytes -= pending[index].byteLength;
+        pending[index] = buffer;
+      } else pending.push(buffer);
+    } else pending.push(buffer);
+    pendingBytes += buffer.byteLength;
+    if (pending.length > 64 || pendingBytes > (128 << 20)) {
+      fail(new Error('The editor worker fell behind incoming plugin messages'));
+      return;
+    }
+    deliver();
+  };
+  // Messages the page answers itself, before or without the editor.
+  const intercept = buffer => {
+    const type = new Uint8Array(buffer, 0, 1)[0];
+    if (type === 68) {
+      // The host's GUI scale overrides the device pixel ratio (BrowserWindowing.cpp
+      // sizes the canvas backing store by StochasHost.pixelRatio()).
+      const scale = new DataView(buffer).getFloat64(4, true);
+      globalThis.StochasWclapPage.hostScale = scale > 0 ? scale : 0;
+      return true;
+    }
+    return false;
+  };
+  globalThis.StochasWclapPage = {
+    hostScale: 0,
+    worker: null,
+    setWorker(worker) {
+      if (!worker) throw new Error('Stochas editor worker did not start');
+      this.worker = worker;
+      worker.addEventListener('message', event => {
+        if (event.data?.stochasMessageDone) {
+          outstanding = false;
+          deliver();
+          return;
+        }
+        if (event.data?.stochasFailure) { fail(new Error(event.data.stochasFailure)); return; }
+        if (event.data?.stochasOut instanceof ArrayBuffer) {
+          this.send(event.data.stochasOut);
+          return;
+        }
+        const reply = event.data?.stochasReply;
+        if (!reply) return;
+        const waiting = calls.get(reply.id);
+        if (!waiting) return;
+        calls.delete(reply.id);
+        if (reply.error) waiting.reject(new Error(reply.error));
+        else waiting.resolve(reply.value);
+      });
+      worker.addEventListener('error', event => fail(event.error || event.message));
+      worker.addEventListener('messageerror', () => fail(new Error('The editor worker could not receive a message')));
+    },
+    call(name, returnType = null, argTypes = [], args = []) {
+      if (!this.worker || stopped) return Promise.reject(new Error('The editor worker is unavailable'));
+      if (calls.size >= 128) {
+        const error = new Error('The editor worker fell behind UI actions');
+        fail(error);
+        return Promise.reject(error);
+      }
+      const id = ++nextCall;
+      return new Promise((resolve, reject) => {
+        calls.set(id, {resolve, reject});
+        this.worker.postMessage({stochasCall: {id, name, returnType, argTypes, args}});
+      });
+    },
+    transferCanvas(canvas) {
+      if (!this.worker) throw new Error('Stochas editor worker is unavailable');
+      const offscreen = canvas.transferControlToOffscreen();
+      this.worker.postMessage({stochasCanvas: {id: canvas.id, canvas: offscreen}}, [offscreen]);
+    },
+    send(buffer) { window.parent.postMessage(buffer, '*', [buffer]); },
+    // The editor is up and has said Hello: plug-in messages can be delivered.
+    ready() {
+      receiving = true;
+      deliver();
+      globalThis.StochasAccessibility?.attach(Module);
+    },
+    connected() {
+      status.hidden = true;
+    },
+  };
+  addEventListener('message', event => {
+    if (event.source !== window.parent || !(event.data instanceof ArrayBuffer)) return;
+    if (event.data.byteLength < 4) return;
+    if (intercept(event.data)) return;
+    enqueue(event.data);
+  });
+  if (!globalThis.crossOriginIsolated) {
+    fail(new Error('this window is not cross-origin isolated, which the editor needs for its threads'));
+    return;
+  }
+  if (typeof Worker !== 'function' || typeof OffscreenCanvas !== 'function' ||
+      typeof HTMLCanvasElement.prototype.transferControlToOffscreen !== 'function') {
+    fail(new Error('this browser cannot run the editor on a worker canvas'));
+    return;
+  }
+  const load = async (name, as) => {
+    const response = await fetch(new URL(name, base));
+    if (!response.ok) throw new Error(`${name} (${response.status})`);
+    const result = as === 'bytes' ? new Uint8Array(await response.arrayBuffer()) : await response.text();
+    progress.value++;
+    return result;
+  };
+  const runScript = blob => new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = URL.createObjectURL(blob);
+    script.onload = resolve;
+    script.onerror = () => reject(new Error('a script did not run'));
+    document.body.append(script);
+  });
+  (async () => {
+    const [support, glue, wasm] = await Promise.all([
+      load('support.js'), load('stochas-ui.js'), load('stochas-ui.wasm', 'bytes')]);
+    message.textContent = 'Starting Stochas…';
+    const glueBlob = new Blob([glue], {type: 'text/javascript'});
+    globalThis.Module = {
+      stochasWclap: true,
+      // Threads start from the same script; the .data package and anything
+      // else resolve next to this page.
+      mainScriptUrlOrBlob: glueBlob,
+      locateFile: path => new URL(path, base).href,
+      instantiateWasm(imports, done) {
+        WebAssembly.instantiate(wasm, imports).then(result => done(result.instance, result.module), fail);
+        return {};
+      },
+      setStatus() {},
+      onAbort: fail,
+      onRuntimeInitialized() {},
+    };
+    await runScript(new Blob([support], {type: 'text/javascript'}));
+    await runScript(glueBlob);
+  })().catch(fail);
+})();
+</script>
+</body>
+</html>

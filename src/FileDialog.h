@@ -17,6 +17,7 @@
 
 #define CPTID_OK 10
 #define CPTID_CANCEL 11
+#define CPTID_COMPUTER 12
 
 
 class SeqFileDialog : public SeqModalDialog, public FileBrowserListener {
@@ -26,6 +27,13 @@ class SeqFileDialog : public SeqModalDialog, public FileBrowserListener {
    std::unique_ptr<FileBrowserComponent> mBrowser;
    std::unique_ptr<TextButton> mBtnOk;
    std::unique_ptr<TextButton> mBtnCancel;
+#if JUCE_WASM
+   std::unique_ptr<TextButton> mBtnComputer;
+   std::unique_ptr<FileChooser> mComputerChooser;
+   String mComputerResult;
+   bool mSaveToComputer=false;
+   void chooseComputerFile();
+#endif
    std::unique_ptr<Label> mLblMain;
    std::unique_ptr<WildcardFileFilter> mFileFilter;
    LookAndFeel_V3 mLookAndFeel;

@@ -9,6 +9,7 @@
  ***************************************************************/
 
 #include "SeqRandom.h"
+#include "PcgAdvance.h"
 
 // set the seed used for this sequence of random numbers.
 // sequence number allows us to get a different sequence of rng values
@@ -18,6 +19,8 @@ void SeqRandom::setRandomSeedAndSequence(uint64 seed, uint64 seqno)
 {
    pcg32_random_t root;
    mHighestCalculatedFrame = 0;
+   for (auto &valid : mKeyFrameValid) valid = false;
+   mKeyFrameValid[0] = true;
    // these two help avoid over-generating
    mLastGeneratedPosition = -1;
    mLastGeneratedFrame = -1;
@@ -53,25 +56,21 @@ int SeqRandom::getRandAtPosition(int pos, int size)
 
    int ctr;
 
-   // do we have this frame already calculated?
-   if (mHighestCalculatedFrame < frame) {
-      pcg32_random_t start;
-      start.inc = mSequenceNumber;
-      start.state = mKeyFrames[mHighestCalculatedFrame];
-
-      // calculate the ones we don't have up to this one
-      for (int i = mHighestCalculatedFrame + 1; i <= frame; i++) {
-         for (int j = 0; j < FRAME_SIZE; j++) {
-            pcg32_random_r(&start);
-            mStats.generations++;
-         }
-         mKeyFrames[i] = start.state;
-      }
-      mHighestCalculatedFrame = frame;
+   // A seek may cross six million discarded random values. Fill only the
+   // requested frame by exact LCG jump-ahead, deriving gaps lazily from the
+   // nearest already-known lower frame. Preserve the original highest-frame
+   // rule and cached boundary states, including bounded-random rejection draws.
+   if (!mKeyFrameValid[frame]) {
+      int previous = frame - 1;
+      while (previous > 0 && !mKeyFrameValid[previous]) --previous;
+      const uint64_t distance = uint64_t(frame - previous) * FRAME_SIZE;
+      mKeyFrames[frame] = stochasPcgAdvance(mKeyFrames[previous], mSequenceNumber, distance);
+      mKeyFrameValid[frame] = true;
+      mStats.generations += (int)distance;
+      if (frame > mHighestCalculatedFrame) mHighestCalculatedFrame = frame;
    }
    else
       mStats.frame_saves++;
-
 
    // save time if moving sequentially
    // if frame is same as last time and we are in a greater position in that
@@ -88,11 +87,8 @@ int SeqRandom::getRandAtPosition(int pos, int size)
    }
 
    // generate intermediate values
-   while (ctr) {
-      mStats.generations++;
-      pcg32_random_r(&cur);
-      ctr--;
-   };
+   mStats.generations += ctr;
+   cur.state = stochasPcgAdvance(cur.state, cur.inc, (uint64_t)ctr);
 
    // save time next time if we are moving sequentially      
    mLastGeneratedPosition = pos_in_frame;
@@ -101,9 +97,10 @@ int SeqRandom::getRandAtPosition(int pos, int size)
    int ret = pcg32_boundedrand_r(&cur, size);
    // if we are on the last position of a previous frame
    // save generations as well because this will be the value of the next keyframe
-   if (pos_in_frame == FRAME_SIZE - 1 && frame == mHighestCalculatedFrame) {
+   if (pos_in_frame == FRAME_SIZE - 1 && frame == mHighestCalculatedFrame && frame + 1 < NUM_KEY_FRAMES) {
       mHighestCalculatedFrame++;
       mKeyFrames[mHighestCalculatedFrame] = cur.state;
+      mKeyFrameValid[mHighestCalculatedFrame] = true;
       mStats.end_saves++;
    }
    mLastGenerated = cur.state;

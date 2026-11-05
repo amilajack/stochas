@@ -15,89 +15,35 @@
 
 bool StochaEngine::addMidiEvent(int startSamples, int8_t note, int8_t velo, int8_t chan, int numSamples)
 {
-   int transp,i;
-   StochaEvent *a = nullptr, *b = nullptr, *cur = nullptr;
-   SequenceData *s = mSeq->getAudSeqData();
-   SequenceLayer *sd =  s->getLayer(mLayer);
-   
-   // do we need to transpose the note?
-   transp = mOverrideTranspose.get(0) + note;
-   if (transp > 127)
-      note = 127;
-   else if (transp < 0)
-      note = 0;
-   else
-      note = (int8_t)transp;
+   const int transpose = mOverrideTranspose.get(0) + note;
+   note = (int8_t)jlimit(0, 127, transpose);
+   const int64_t start = mTimeline + startSamples;
+   const int existing = velo ? mEvents.matchingOff(note, chan, start) : -1;
+   const bool combine = mSeq->getAudSeqData()->getLayer(mLayer)->isCombineMode();
+   if (existing != -1 && combine) {
+      mEvents.setTime(existing, start + numSamples);
+      return true;
+   }
+   if (mEvents.available() < (velo ? 2 : 1))
+      return false;
+   if (existing != -1)
+      mEvents.setTime(existing, mTimeline + (startSamples ? startSamples - 1 : 0));
 
-   // see if we must combine with another playing note   
-   // or stop that one before this one starts
-   for (i = 0; i < SEQ_MAX_MIDI_EVENTS; i++) {
-      cur = &mEvents[i];
-      // see if the same note is already playing and will be playing
-      // when we add our new note
-      if (velo &&
-         cur->mNote == note &&
-         cur->mChan == chan &&
-         cur->mVelo == 0 &&
-         cur->mNumSamples > startSamples) {
-
-         if (sd->isCombineMode()) {
-            cur->mNumSamples = startSamples + numSamples;
-            return true; // nothing further to do
-         }
-         else { // truncate that note
-            cur->mNumSamples = startSamples ? startSamples - 1 : 0;
-            break; // continue to add our new note
-         }
+   const int on = mEvents.insert({start, note, velo, chan, -1});
+   if (on == -1)
+      return false;
+   if (velo) {
+      const int off = mEvents.insert({start + numSamples, note, 0, chan, -1});
+      if (off == -1) {
+         mEvents.erase(on);
+         return false;
       }
-   }   
-   
-
-   // we need two available slots, one for note on and one for note off
-   for (i = 0; i < SEQ_MAX_MIDI_EVENTS; i++) {
-      cur = &mEvents[i];
-      if (cur->mNumSamples == -1) { // slot is available
-         if (a == nullptr)
-            a = cur;
-         else if (b == nullptr) {
-            b = cur;
-            break; // we have both slots we need
-         }
-      }      
+      mEvents.setCorrespondingOff(on, off);
    }
-   if(a==nullptr || (velo && b==nullptr)) 
-      return false; // no slots available now
-
-   
-
-   // note on (or off in the case of velo=0)
-   a->mNumSamples = startSamples;
-   a->mNote = note;
-   a->mVelo = velo;
-   a->mChan = chan;
-   if (velo) { // if it's a note on
-      mNumActiveNoteOnEvents++;
-
-      // add a corresponding note off
-      a->mCorrespondingNoteOff = b;
-
-      // note off
-      b->mNumSamples = startSamples + numSamples;
-      b->mNote = note;
-      b->mVelo = 0;      
-      b->mChan = chan;
-   } else {
-      a->mCorrespondingNoteOff = nullptr;      
-   }
-
-   mNumActiveNoteOffEvents++;
-   
    return true;
 }
 
 StochaEngine::StochaEngine() :
-   mNumActiveNoteOnEvents(0),
-   mNumActiveNoteOffEvents(0),
    mCurrentStepPosition(INVALIDPOS),
    mRealStepPosition(INVALIDREALPOS),
    mSeq(nullptr),
@@ -246,6 +192,11 @@ StochaEngine::playPositionChange(int samples_per_step, // samples per sequencer 
 
    // clear this position in our tracker of notes
    mDependencySource[position].reset();
+   uint32_t played[PlayedWords]{};
+   const auto publishPlayed = [&] {
+      for(unsigned word=0;word<PlayedWords;++word)
+         mPlayed[position][word].store(played[word],std::memory_order_release);
+   };
 
    // assuming we are not muted we play. We still need to do the above if we are
    // muted, so that our deterministic random chain is not broken.
@@ -256,6 +207,7 @@ StochaEngine::playPositionChange(int samples_per_step, // samples per sequencer 
 
          // add it to our tracker of notes that have played
          mDependencySource[position].set(mMulti[i].rowToPlay);
+         played[mMulti[i].rowToPlay/32] |= uint32_t{1} << (mMulti[i].rowToPlay%32);
 
          int8_t whichNote = sd->getCurNote(mMulti[i].rowToPlay);
          if (whichNote != -1) { // -1 is the "off" note, which we ignore
@@ -378,7 +330,7 @@ StochaEngine::playPositionChange(int samples_per_step, // samples per sequencer 
                 (int8_t)mOverrideOutputChannel.get(
                 sd->getMidiChannel()), // midi channel to play on
           lensize)) // size in steps + size of one step (which is adjusted by duty cycle)
-                    return false;
+                  { publishPlayed(); return false; }
 
                   // set position for next trigger (if applicable)
                   gruuvOffset += samples_per_trigger;
@@ -387,6 +339,7 @@ StochaEngine::playPositionChange(int samples_per_step, // samples per sequencer 
          } // note is not -1
       } // for 0 to playcount
    } // if not muted
+   publishPlayed();
    return true;
 }
 
@@ -826,37 +779,35 @@ void StochaEngine::performMidiMapAction(int action, int value)
 
 void StochaEngine::rebuildMappingSchema()
 {
-   // this rebuilds our linked list hash mechanism to optimize for
-   // incoming data
-   SequenceData *sd= mSeq->getAudSeqData();
-   MidiMappingItem *cur;
-   int len = sd->getMappingCount();
+   SequenceData *sd = mSeq->getAudSeqData();
+   const int len = sd->getMappingCount();
+   jassert(len >= 0 && len <= SEQMIDI_MAX_ITEMS);
+   if (len < 0 || len > SEQMIDI_MAX_ITEMS)
+      return; // malformed counts must not overrun the prepared storage
+
+   MidiMappingItem *tails[128] = {};
+   int used = 0;
    for (int i = 0; i < len; i++) {
       SeqMidiMapItem *mm = sd->getMappingItem(i);
-      if (mm->mAction != SEQMIDI_ACTION_INVALID && 
-         mm->mTarget != 0 &&
-         mm->mValue != 0 && 
-         mm->mChannel != 0 && 
-         mm->mNote >= 0 && 
-         (mm->mTarget== SEQMIDI_TARGET_ALL || mm->mTarget == (mLayer+1))
-         ) {
-         if (!mMapping[mm->mNote]) {
-            cur = mMapping[mm->mNote] = new MidiMappingItem();
-         } else {
-            cur = mMapping[mm->mNote];
-            while (cur->mNext) {
-               cur = cur->mNext;
-            }
-            cur->mNext = new MidiMappingItem();
-            cur = cur->mNext;
-         }
+      if (mm->mAction != SEQMIDI_ACTION_INVALID &&
+         mm->mTarget != 0 && mm->mValue != 0 && mm->mChannel != 0 &&
+         mm->mNote >= 0 &&
+         (mm->mTarget == SEQMIDI_TARGET_ALL || mm->mTarget == mLayer + 1)) {
+         // At most one node is used per source mapping; ordering within
+         // each note is unchanged, including multiple actions for note127.
+         auto *cur = &mMappingStorage[used++];
+         cur->mNext = nullptr;
+         if (tails[mm->mNote])
+            tails[mm->mNote]->mNext = cur;
+         else
+            mMapping[mm->mNote] = cur;
+         tails[mm->mNote] = cur;
          cur->mChannel = mm->mChannel;
          cur->mAction = mm->mAction;
          cur->mValue = mm->mValue;
          cur->mType = mm->mType;
       }
    }
-
    mMappingIsValid = true;
 }
 
@@ -963,34 +914,19 @@ bool StochaEngine::isMandatory(int col, int row, bool * off, int pat)
    return ret;
 }
 
-void 
+void
 StochaEngine::quiesceMidi(bool moveNoteOffs)
 {
-   int i;
-   StochaEvent *cur = nullptr;
-   for (i = 0; i < SEQ_MAX_MIDI_EVENTS; i++) {
-      cur = &mEvents[i];
-      if (cur->mNumSamples != -1) { // is in use?
-         if (cur->mVelo > 0) { // is note on? delete all note on events that exist
-            // we will really have a note off unless you are an idiot
-            jassert(cur->mCorrespondingNoteOff != nullptr);
-            cur->mCorrespondingNoteOff->clear(); // remove it's corresponding note off event
-            mNumActiveNoteOffEvents--;
-            cur->clear(); // and remove itself
-         }
+   // Pending on/off pairs have never sounded and are cancelled together.
+   mEvents.forEachSlot([this](int slot, const auto &event) {
+      if (event.velocity > 0) {
+         const int off = event.correspondingOff;
+         mEvents.erase(off);
+         mEvents.erase(slot);
       }
-   }
-   mNumActiveNoteOnEvents=0;
-
-   if (moveNoteOffs) { // find any remaining note off events and move them forward
-      for (i = 0; i < SEQ_MAX_MIDI_EVENTS; i++) {
-         cur = &mEvents[i];
-         if (cur->mNumSamples != -1) { // is in use?
-            jassert(cur->mVelo == 0); // it better be a note off, because we removed the note on's above
-            cur->mNumSamples = 0; // move it to occur right away
-         }
-      }
-   }
+   });
+   if (moveNoteOffs)
+      mEvents.forEachSlot([this](int slot, const auto &) { mEvents.setTime(slot, mTimeline); });
 }
 
 bool StochaEngine::processBlock(double beatPosition,    // which quarter measure we are on
@@ -1134,8 +1070,11 @@ bool StochaEngine::processBlock(double beatPosition,    // which quarter measure
       // for cubase, start_steppos_in_track might be after our REAL start
       if (!start_steppos_in_track || start_steppos_in_track <= next_step_position) {         
 #endif
-         if (!playPositionChange((int)spss, next_step_position, samples_until))
-            rc = false;
+         if (!playPositionChange((int)spss, next_step_position, samples_until)) {
+            // Do not keep evaluating a dense block after a prepared-capacity
+            // refusal. The processor/CLAP adapter must report and recover it.
+            return false;
+         }
 #ifdef CUBASE_HACKS
       }
 #endif
@@ -1162,10 +1101,22 @@ void StochaEngine::playbackStopped()
    quiesceMidi();
 
    // clear out played note tracker
-   for (int i = 0; i < SEQ_MAX_STEPS; i++)
+   for (int i = 0; i < SEQ_MAX_STEPS; i++) {
       mDependencySource[i].reset();
+      for(auto &word:mPlayed[i])word.store(0,std::memory_order_release);
+   }
 
    
+}
+
+void StochaEngine::resetProcessingState()
+{
+   playbackStopped();
+   mTimeline = 0;
+   // A MIDI effect releases already-sounding external notes at the next output
+   // opportunity; future note-ons and their offs were cancelled together.
+   mEvents.forEachSlot([this](int slot, const auto &) { mEvents.setTime(slot, 0); });
+   mOldSeed = mOldSeq = 0;
 }
 
 void StochaEngine::setPlaybackStartPosition(double pos)
@@ -1174,76 +1125,40 @@ void StochaEngine::setPlaybackStartPosition(double pos)
 }
 
 bool
-StochaEngine::getMidiEvent(int numSamplesInBlock, int * pos, int8_t * note, int8_t * velo, int8_t *chan)
+StochaEngine::getMidiEvent(int numSamplesInBlock, int *pos, int8_t *note, int8_t *velo, int8_t *chan)
 {
-   StochaEvent *cur = nullptr;
-   bool rc = true;
-
-   // first see if there are any note-off events that need to come out
-   // we need to put these out before any note on events in case we get a note-on and note-off at same sample
-   // position. the note off needs to come out first
-   if (mNumActiveNoteOffEvents) {
-      for (int i = 0; i < SEQ_MAX_MIDI_EVENTS; i++) {
-         cur = &mEvents[i];
-         if (cur->mVelo == 0 && cur->mNumSamples != -1) { // it's occupied
-            if (cur->mNumSamples < numSamplesInBlock) { // it needs to be sent out with this block
-               *pos = cur->mNumSamples;
-               *note = cur->mNote;
-               *velo = cur->mVelo;
-               *chan = cur->mChan;
-               cur->clear(); // make the slot available 
-               mNumActiveNoteOffEvents--;
-               goto end;
-            }
-         }
+   int slot = mEvents.first();
+   // A later retrigger can truncate an as-yet-unheard pair to zero duration.
+   // Cancel that pair instead of emitting off-before-on and leaving a stuck note.
+   while (slot != -1) {
+      const auto event = mEvents.get(slot);
+      if (event.sample >= mTimeline + numSamplesInBlock)
+         return false;
+      if (event.velocity == 0 && mEvents.contains(event.correspondingOn) &&
+          event.sample <= mEvents.get(event.correspondingOn).sample) {
+         mEvents.erase(event.correspondingOn);
+         mEvents.erase(slot);
+         slot = mEvents.first();
+      } else {
+         break;
       }
    }
-
-   // now output the rest of them (note on's)
-   if (mNumActiveNoteOnEvents) {
-      for (int i = 0; i < SEQ_MAX_MIDI_EVENTS; i++) {
-         cur = &mEvents[i];
-         if (cur->mNumSamples != -1) { // it's occupied
-             // regarding the -1 here: this is to try to resolve the issue of looped playback
-             // when it loops back around and we get an extra note. I'm guessing that its because we
-             // are putting out a note in a block prior to where it actually should be put out.
-             // This may be due to rounding(?)
-             // note that this issue only crops up with certain block sizes and tempos obviously because
-             // it happens (i think) when the event is at the very end of the block and should actually
-             // be fired in the following block.
-            if (cur->mNumSamples < numSamplesInBlock-1) { // it needs to be sent out with this block
-               *pos = cur->mNumSamples;
-               *note = cur->mNote;
-               *velo = cur->mVelo;
-               *chan = cur->mChan;
-               cur->clear(); // make the slot available 
-               mNumActiveNoteOnEvents--;
-               goto end;
-            }
-         }
-      }
-   }
-   rc = false; // no events are ready
-end:
-   return rc;
+   if (slot == -1)
+      return false;
+   const auto event = mEvents.get(slot);
+   *pos = (int)jmax<int64_t>(0, event.sample - mTimeline);
+   *note = (int8_t)event.note;
+   *velo = (int8_t)event.velocity;
+   *chan = (int8_t)event.channel;
+   mEvents.erase(slot);
+   return true;
 }
-
 
 void
 StochaEngine::doneBlock(int numSamplesInBlock)
 {
-   int x;
-   for (int i = 0; i < SEQ_MAX_MIDI_EVENTS; i++) {
-      x = mEvents[i].mNumSamples;
-      if (x != -1) { // if active
-                     // advance it forward
-         x -= numSamplesInBlock;
-         if (x < 0)
-            x = 0;
-         mEvents[i].mNumSamples = x;
-      }
-   }
-
+   // Absolute deadlines avoid a linear walk over prepared storage every block.
+   mTimeline += numSamplesInBlock;
 }
 
 bool
@@ -1253,6 +1168,8 @@ StochaEngine::incomingMidiData(int type,     // note on, off or cc
                                int8_t val)     // if cc number will be cc val
 {
    bool ret = false;
+   if (number < 0)
+      return false;
    if (!mMappingIsValid)
       rebuildMappingSchema();
    MidiMappingItem *mi;
@@ -1261,7 +1178,8 @@ StochaEngine::incomingMidiData(int type,     // note on, off or cc
       while (mi) {
          if (mi->mChannel == chan && mi->mType==type) {
             int myVal;
-            if (mi->mValue == SEQMIDI_VALUE_VARIABLE)
+            if (mi->mValue == SEQMIDI_VALUE_VARIABLE &&
+                (mi->mAction == SEQMIDI_ACTION_PBIAS || mi->mAction == SEQMIDI_ACTION_POSVAR))
                myVal = val;
             else
                myVal = mi->mValue;
@@ -1278,19 +1196,8 @@ StochaEngine::incomingMidiData(int type,     // note on, off or cc
 
 void StochaEngine::resetMappingSchema()
 {
-   if (mMappingIsValid) {
-      // clear current
-      for (int i = 0; i < 127; i++) {
-         MidiMappingItem *tmp;
-         MidiMappingItem *it = mMapping[i];
-         while (it) {
-            tmp = it;
-            it = it->mNext;
-            delete tmp;
-         }
-         mMapping[i] = nullptr;
-      }
-   }
+   for (auto &head : mMapping)
+      head = nullptr;
    mMappingIsValid = false;
 }
 
@@ -1316,7 +1223,6 @@ bool StochaEngine::getStepPlayedState(int position, int notenum)
 {
    jassert(position >= 0 && position < SEQ_MAX_STEPS);
    jassert(notenum >= 0 && notenum < SEQ_MAX_ROWS);
-   // might not be thread safe:
-   return mDependencySource[position].test(notenum);   
+   return (getPlayedWord(position,notenum/32) & (uint32_t{1}<<(notenum%32))) != 0;
 }
 

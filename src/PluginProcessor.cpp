@@ -9,7 +9,10 @@
  ***************************************************************/
 
 #include "PluginProcessor.h"
+#include "EditorState.h"
+#if !defined(STOCHAS_WCLAP_DSP)
 #include "PluginEditor.h"
+#endif
 #include "Persist.h"
 #include "StandaloneSettings.h"
 #include <stdio.h>
@@ -41,6 +44,8 @@ SeqAudioProcessor::SeqAudioProcessor()  :
       mData.swap();
    }
 
+   // Entropy/time gathering is construction work, never a transport callback.
+   mPlaybackSeedState = (uint64_t)generateNewRootSeed();
    memset(mMiniMidiMap, 0, sizeof(MiniMidiMapItem*) * 128);
 
    // init all the layers
@@ -85,6 +90,7 @@ SeqAudioProcessor::SeqAudioProcessor()  :
 
 SeqAudioProcessor::~SeqAudioProcessor()
 {
+   stopTimer();
 
    resetMiniMidiMap();
 
@@ -96,6 +102,21 @@ bool SeqAudioProcessor::getStepPlayedState(int layer, int position, int notenum)
 {
    jassert(layer >= 0 && layer < SEQ_MAX_LAYERS);
    return mStocha[layer].getStepPlayedState(position,notenum);
+}
+
+uint32_t SeqAudioProcessor::getPlayedWord(int layer,int step,int word) const
+{
+   if(layer<0||layer>=SEQ_MAX_LAYERS)return 0;
+   return mStocha[layer].getPlayedWord(step,word);
+}
+void SeqAudioProcessor::setRemotePlayedWord(int layer,int step,int word,uint32_t value)
+{
+   if(layer>=0&&layer<SEQ_MAX_LAYERS)mStocha[layer].setRemotePlayedWord(step,word,value);
+}
+
+void SeqAudioProcessor::flushHostDirtyNotification()
+{
+   if(consumeHostDirtyNotification())updateHostDisplay(ChangeDetails().withNonParameterStateChanged(true));
 }
 
 const String SeqAudioProcessor::getName() const
@@ -159,16 +180,93 @@ void SeqAudioProcessor::changeProgramName (int , const String& )
 {
 }
 
+void SeqAudioProcessor::flushParameterResetNotifications()
+{
+   const uint64_t pending = consumeParameterResetNotifications();
+   if (!pending) return;
+   // This is control-thread work. Coalesce to the latest atomic values while
+   // retaining the original begin/value/end notification sequence.
+   for (int index = 0; index < mAutomationParameters.size(); ++index) {
+      if (pending & (uint64_t{1} << index)) {
+         AudioProcessorParameter *parameter = mAutomationParameters[index];
+         parameter->beginChangeGesture();
+         parameter->sendValueChangedMessageToListeners(parameter->getValue());
+         parameter->endChangeGesture();
+      }
+   }
+}
+
+int64 SeqAudioProcessor::nextPlaybackSeed() noexcept
+{
+   // A fresh root seed per playback/loop, generated from instance-local prepared
+   // state. SplitMix64 needs no global Random lock, clock, allocation or syscall.
+   uint64_t value = (mPlaybackSeedState += 0x9e3779b97f4a7c15ULL);
+   value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+   value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+   value ^= value >> 31;
+   return (int64)(value ? value : 1);
+}
+
+bool SeqAudioProcessor::appendPreparedMidi(MidiBuffer &buffer, const void *bytes, int length, int sample)
+{
+   int &count = &buffer == &mRecordedNotes ? mRecordedEventCount : mOutputEventCount;
+   if (length <= 0 || count >= PreparedMidiEvents ||
+       length > PreparedMidiBytes - 6 - buffer.data.size()) {
+      mSchedulingOverload = true;
+      return false;
+   }
+   if (!buffer.addEvent(bytes, length, sample)) {
+      mSchedulingOverload = true;
+      return false;
+   }
+   ++count;
+   return true;
+}
+
 void SeqAudioProcessor::prepareToPlay (double , int )
 {
-    // Use this method as the place to do any pre-playback
-    // initialisation that you need..
+    mProcessedMidi.ensureSize(PreparedMidiBytes);
+    mRecordedNotes.ensureSize(PreparedMidiBytes);
+    mSchedulingOverload = mOverloadLatched = false;
+    mResetFeedbackLow.store(0, std::memory_order_relaxed);
+    mResetFeedbackHigh.store(0, std::memory_order_relaxed);
+#if !defined(STOCHAS_WCLAP_DSP)
+    startTimerHz(30);
+#endif
     if (wrapperType == wrapperType_Standalone)
         StandaloneSettings::load();
 }
 
+void SeqAudioProcessor::reset()
+{
+   resetProcessingState(true);
+}
+void SeqAudioProcessor::resetProcessingState(bool discardCommands)
+{
+   for (auto &engine : mStocha) engine.resetProcessingState();
+   mPlaying = false; mLastPosition = 0;
+   mMPBstate = MPBstopped; mMPBrequestArmed = false; mMPBStartPosition = 0;
+   mClockPrimed = mTransportRunning = false; mClockNextTick = 0;
+   mSchedulingOverload = mOverloadLatched = false;
+   mPendingHostReset = true;
+   mProcessedMidi.clear(); mRecordedNotes.clear();
+   if(discardCommands)mIncomingData.discardPending();
+   for (auto &note : mMidiRecord) { note.vel = 0; note.stepPos = 0; note.stepPosFrac = 0; }
+   // CLAP reset must not change parameters or canonical patterns. Reapply the
+   // current atomic values through the original DSP automation handlers only.
+   for (AudioProcessorParameter *parameter : getParameters())
+      parameter->setValue(parameter->getValue());
+   applyPendingAutomation();
+   for (int layer = 0; layer < SEQ_MAX_LAYERS; ++layer) {
+      mNotifier.setPlayPosition(layer,-1); mNotifier.setCurrentPattern(layer,-1);
+   }
+   mNotifier.setRecordingState(mRecordingMode ? SeqProcessorNotifier::standby : SeqProcessorNotifier::off);
+}
+
 void SeqAudioProcessor::releaseResources()
 {
+    stopTimer();
+    flushParameterResetNotifications();
     // When playback stops, you can use this as an opportunity to free up any
     // spare memory, etc.
 }
@@ -199,53 +297,39 @@ bool SeqAudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
 
 void SeqAudioProcessor::resetMiniMidiMap()
 {
-   for (int i = 0; i < 127; i++) {
-      MiniMidiMapItem *tmp;
-      MiniMidiMapItem *it = mMiniMidiMap[i];
-      while (it) {
-         tmp = it;
-         it = it->mNext;
-         delete tmp;
-      }
-      mMiniMidiMap[i] = nullptr;
-   }
+   for (auto &head : mMiniMidiMap)
+      head = nullptr;
 }
 
-// check the midi mapping. if any mapping for playback start/stop or record start/stop, grab it
+// Mapping edits reach this method from processBlock. Nodes are prepared with
+// the processor, including all 100 legal mappings and MIDI note127.
 void SeqAudioProcessor::rebuildMiniMidiMap()
 {
-   // this rebuilds our linked list hash mechanism to optimize for
-   // incoming data
    SequenceData *sd = mData.getAudSeqData();
-   int len = sd->getMappingCount();
-   int i;
-   MiniMidiMapItem *cur;
-
-   // free old
+   const int len = sd->getMappingCount();
    resetMiniMidiMap();
-   // build new
-   for (i = 0; i < len; i++) {
+   jassert(len >= 0 && len <= SEQMIDI_MAX_ITEMS);
+   if (len < 0 || len > SEQMIDI_MAX_ITEMS)
+      return;
+
+   MiniMidiMapItem *tails[128] = {};
+   int used = 0;
+   for (int i = 0; i < len; i++) {
       SeqMidiMapItem *mm = sd->getMappingItem(i);
-      if ((mm->mAction == SEQMIDI_ACTION_PLAYBACK || mm->mAction == SEQMIDI_ACTION_RECORD) && mm->mValue != 0 &&
-         mm->mChannel != 0 && mm->mNote >= 0) {
-
-         if (!mMiniMidiMap[mm->mNote]) {
-            cur = mMiniMidiMap[mm->mNote] = new MiniMidiMapItem();
-         }
-         else {
-            cur = mMiniMidiMap[mm->mNote];
-            while (cur->mNext) {
-               cur = cur->mNext;
-            }
-            cur->mNext = new MiniMidiMapItem();
-            cur = cur->mNext;
-         }
-
+      if ((mm->mAction == SEQMIDI_ACTION_PLAYBACK || mm->mAction == SEQMIDI_ACTION_RECORD) &&
+          mm->mValue != 0 && mm->mChannel != 0 && mm->mNote >= 0) {
+         auto *cur = &mMiniMidiStorage[used++];
+         cur->mNext = nullptr;
+         if (tails[mm->mNote])
+            tails[mm->mNote]->mNext = cur;
+         else
+            mMiniMidiMap[mm->mNote] = cur;
+         tails[mm->mNote] = cur;
          cur->mChannel = mm->mChannel;
-         cur->mValue = mm->mValue; // start/stop/toggle
+         cur->mValue = mm->mValue;
          cur->mType = mm->mType;
       }
-   }   
+   }
 }
 
 // request to either start or stop playback
@@ -276,6 +360,8 @@ SeqAudioProcessor::handleMiniMidiMap(int type, int8_t number, int8_t chan, int8_
    MiniMidiMapItem *mi;
    // this is an array sized to number of midi notes
    jassert(number >= 0);
+   if (number < 0)
+      return;
 
    SequenceData *seq = mData.getAudSeqData();
 
@@ -343,6 +429,12 @@ void SeqAudioProcessor::handleIncomingMidi(bool currentlyPlaying,
       int passthru = sd->getMidiPassthru();
 
       for (const MidiMessageMetadata it : midiMessages) {
+         if (it.numBytes > 3) {
+            mNotifier.setMidiEventOccurred(SEQ_MIDI_OTHER, 0, 0, 0);
+            if (passthru != SEQ_MIDI_PASSTHRU_NONE)
+               appendPreparedMidi(processedMidi, it.data, it.numBytes, it.samplePosition);
+            continue;
+         }
          MidiMessage msg = it.getMessage();
          int position = it.samplePosition;
          bool remove = (passthru == SEQ_MIDI_PASSTHRU_NONE);
@@ -400,7 +492,7 @@ void SeqAudioProcessor::handleIncomingMidi(bool currentlyPlaying,
             // record, it's assumed they want to respond to midi) then build up our buffer with
             // those notes
             if (mRecordingMode && !handled && (msg.isNoteOn() || msg.isNoteOff())) {
-               recordedNotes.addEvent(msg, position);
+               appendPreparedMidi(recordedNotes, msg, position);
             }
 
             // if we handled it, and in this mode, we remove it
@@ -413,7 +505,7 @@ void SeqAudioProcessor::handleIncomingMidi(bool currentlyPlaying,
 
          // add the event to our output buffer
          if (!remove) {
-            processedMidi.addEvent(msg, position);
+            appendPreparedMidi(processedMidi, msg, position);
          }
       } // while get event
    } // if incoming midi
@@ -430,6 +522,7 @@ SeqAudioProcessor::checkIncomingMidiForStartStop(MidiBuffer &midiMessages)
 
    // scan thru the buffer and react to note on/off
    for (const MidiMessageMetadata it : midiMessages) {
+      if (it.numBytes > 3) continue; // Opaque long messages cannot map to note start/stop.
       MidiMessage msg = it.getMessage();
      
       int8_t midiNumber = 0; // note number or cc number
@@ -516,7 +609,8 @@ void SeqAudioProcessor::dispatchRecordedMidiNotes(MidiBuffer &midiNoteData)
             if (length < 0)
                length = 0;
 
-            mNotifier.addCompletedMidiNote(noteNum, mMidiRecord[noteNum].vel, length, gridPos);
+            if(!mNotifier.addCompletedMidiNote(noteNum, mMidiRecord[noteNum].vel, length, gridPos))
+               mSchedulingOverload = true;
             mMidiRecord[noteNum].vel = 0; // clear it for next time            
          }
       }
@@ -541,22 +635,31 @@ void SeqAudioProcessor::checkforUIIncomingData(MidiBuffer & processedMidi)
     *      1 - SEQ_STANDALONE_SET_TEMPO
     */
 
-   while (mIncomingData.readFromFifo(&fifoData1, &fifoData2, &fifoData3)) {
+   for (int budget = 0; budget < FIFO_SIZE && mIncomingData.readFromFifo(&fifoData1, &fifoData2, &fifoData3); ++budget) {
       switch (fifoData1) {
       case SEQ_MIDI_NOTEON:
       case SEQ_MIDI_NOTEOFF: {
+         if(fifoData2<0||fifoData2>=SEQ_MAX_LAYERS||fifoData3<0||fifoData3>=SEQ_MAX_ROWS) {
+            mSchedulingOverload=true;break;
+         }
          SequenceLayer *dl = sd->getLayer(fifoData2);
          int8_t chan = dl->getMidiChannel();
          int8_t note = dl->getCurNote(fifoData3);
-         MidiMessage m;
+         auto &held=mAuditions[fifoData2][fifoData3];
          // note that this currently ignores automation override of midi channel (which I think is fine)
          if (fifoData1 == SEQ_MIDI_NOTEOFF) { // note off
-            m = MidiMessage::noteOff(chan, (int)note, (uint8)0);
-            processedMidi.addEvent(m, 0);
+            if(held.note>=0) {
+               appendPreparedMidi(processedMidi,MidiMessage::noteOff(held.channel,held.note,(uint8)0),0);
+               held.note=-1;--mAuditionCount;
+            }
          }
          else if (fifoData1 == SEQ_MIDI_NOTEON) { // note on         
-            m = MidiMessage::noteOn(chan, (int)note, (uint8)127);
-            processedMidi.addEvent(m, 0);
+            if(held.note>=0)appendPreparedMidi(processedMidi,MidiMessage::noteOff(held.channel,held.note,(uint8)0),0);
+            else if(note>=0)++mAuditionCount;
+            if(note>=0) {
+               held.channel=chan;held.note=note;
+               appendPreparedMidi(processedMidi,MidiMessage::noteOn(chan,(int)note,(uint8)127),0);
+            } else if(held.note>=0) {held.note=-1;--mAuditionCount;}
          }
          break;
       }
@@ -577,7 +680,7 @@ void SeqAudioProcessor::checkforUIIncomingData(MidiBuffer & processedMidi)
          // mDummyParam->setValueNotifyingHost(f);
 
          // this is the proper way to do it
-         updateHostDisplay (ChangeDetails().withNonParameterStateChanged (true));
+         mHostDirty.store(true,std::memory_order_release);
          break;
       }
       case SEQ_SET_RECORD_MODE:
@@ -605,6 +708,16 @@ void SeqAudioProcessor::checkforUIIncomingData(MidiBuffer & processedMidi)
          jassertfalse;
       }
    }
+}
+
+void SeqAudioProcessor::releaseAuditions(MidiBuffer &output)
+{
+   if(!mAuditionCount)return;
+   for(auto &layer:mAuditions)for(auto &held:layer)if(held.note>=0) {
+      appendPreparedMidi(output,MidiMessage::noteOff(held.channel,held.note,(uint8)0),0);
+      held.note=-1;
+   }
+   mAuditionCount=0;
 }
 
 // determine whether manual playback is started
@@ -807,12 +920,12 @@ void SeqAudioProcessor::sendMidiClockAndTransport(MidiBuffer &out, bool starting
    // transport
    bool wantRunning = mPlaying && StandaloneSettings::getSendMidiTransport();
    if (startingPlayback && wantRunning) {
-      out.addEvent(MidiMessage::midiStart(), 0);
+      appendPreparedMidi(out, MidiMessage::midiStart(), 0);
       mTransportRunning = true;
    }
    else if (wantRunning != mTransportRunning) {
       // either transport was switched on/off mid-play, or we are stopping
-      out.addEvent(wantRunning ? MidiMessage::midiContinue() : MidiMessage::midiStop(), 0);
+      appendPreparedMidi(out, wantRunning ? MidiMessage::midiContinue() : MidiMessage::midiStop(), 0);
       mTransportRunning = wantRunning;
    }
 
@@ -835,7 +948,7 @@ void SeqAudioProcessor::sendMidiClockAndTransport(MidiBuffer &out, bool starting
    // ensures that every tick is sent exactly once
    for (int64 t = mClockNextTick; t < end; t++) {
       int pos = (int)(((double)t - startTick) / (endTick - startTick) * numSamples);
-      out.addEvent(MidiMessage::midiClock(), jlimit(0, numSamples - 1, pos));
+      appendPreparedMidi(out, MidiMessage::midiClock(), jlimit(0, numSamples - 1, pos));
    }
    if (end > mClockNextTick)
       mClockNextTick = end;
@@ -843,11 +956,30 @@ void SeqAudioProcessor::sendMidiClockAndTransport(MidiBuffer &out, bool starting
 
 void SeqAudioProcessor::processBlock(AudioSampleBuffer& buffer, MidiBuffer& midiMessages)
 {
+   mData.beginAudioBlock();
+   const auto stateRevision=mData.getAudioStateRevision();
+   if(stateRevision!=mAppliedStateRevision) {
+      resetProcessingState(false);
+      mAppliedStateRevision=stateRevision;
+   }
+   mNotifier.beginAudioBlock();
+   const auto mappingRevision = mData.getAudioMappingRevision();
+   if (mappingRevision != mAppliedMappingRevision) {
+      for (auto &engine : mStocha) engine.resetMappingSchema();
+      rebuildMiniMidiMap();
+      mAppliedMappingRevision = mappingRevision;
+      if (wrapperType == wrapperType_Standalone) changeStandaloneTempo();
+   }
+   applyPendingAutomation();
    
-   MidiBuffer processedMidi; // buffer that holds output midi (initially empty)
-   MidiBuffer recordedNotes; // buffer that holds recorded notes (if recording)
+   auto &processedMidi = mProcessedMidi;
+   auto &recordedNotes = mRecordedNotes;
+   processedMidi.clear(); recordedNotes.clear();
+   mOutputEventCount = mRecordedEventCount = 0;
+   mSchedulingOverload = mIncomingData.consumeOverflow();
    AudioPlayHead *ph = getPlayHead();
    AudioPlayHead::CurrentPositionInfo posinfo;
+   const bool emitResetOffs = mPendingHostReset;
    bool stoppingPlayback = false;
    bool startingPlayback = false;
    bool areWePlaying = false;
@@ -866,7 +998,7 @@ void SeqAudioProcessor::processBlock(AudioSampleBuffer& buffer, MidiBuffer& midi
    if(wrapperType == wrapperType_Standalone) { 
       // in standalone mode, fake it out
       positionInfoStandalone(&posinfo);
-   } else {
+   } else if (ph) {
       ph->getCurrentPosition(posinfo);
    }
 
@@ -886,6 +1018,8 @@ void SeqAudioProcessor::processBlock(AudioSampleBuffer& buffer, MidiBuffer& midi
       else
          return;
    }
+   mPendingHostReset = false;
+   if(emitResetOffs)releaseAuditions(processedMidi);
    // END BITWIG FIX
 
    // position adjustment (which is a problem with protools and nothing else)
@@ -925,6 +1059,11 @@ void SeqAudioProcessor::processBlock(AudioSampleBuffer& buffer, MidiBuffer& midi
       areWePlaying = determinePlaybackState(seq->getAutoPlayMode(), posinfo.isPlaying,
          beatsperbar, samplerate, posinfo.bpm, posinfo.ppqPosition, samplesperblock);
    }
+
+   if (!posinfo.isPlaying)
+      mOverloadLatched = false;
+   if (mOverloadLatched)
+      areWePlaying = false;
 
    // determine whether we are transitioning from playing to not playing
    // or vice versa
@@ -974,7 +1113,7 @@ void SeqAudioProcessor::processBlock(AudioSampleBuffer& buffer, MidiBuffer& midi
       int64 seed = seq->getRandomSeed();
       if (seed == 0) {
          // we need to generate a new random seed         
-         seed = generateNewRootSeed();         
+         seed = nextPlaybackSeed();
          // we also need to make the ui aware of the seed in case the
          // user clicks "stable" so that it pulls that new seed to save with
          // the patch
@@ -1024,6 +1163,11 @@ void SeqAudioProcessor::processBlock(AudioSampleBuffer& buffer, MidiBuffer& midi
       // also reset automation values      
       for (i = 0; i < mAutomationParameters.size(); i++)
          mAutomationParameters[i]->reset();
+      applyPendingAutomation();
+      const int parameterCount = mAutomationParameters.size();
+      const uint64_t feedback = parameterCount == 64 ? ~uint64_t{0} : (uint64_t{1} << parameterCount) - 1;
+      mResetFeedbackLow.fetch_or((uint32_t)feedback, std::memory_order_release);
+      mResetFeedbackHigh.fetch_or((uint32_t)(feedback >> 32), std::memory_order_release);
 
       // also turn off recording mode
       mRecordingMode = false;
@@ -1041,8 +1185,7 @@ void SeqAudioProcessor::processBlock(AudioSampleBuffer& buffer, MidiBuffer& midi
          if (startingPlayback && mMPBstate==MPBstarted) {
             mStocha[i].setPlaybackStartPosition(mMPBStartPosition);
          }
-         // todo get retval and blink some overflow light if false
-         mStocha[i].processBlock(posinfo.ppqPosition, //which quarter measure we are on
+         if (!mStocha[i].processBlock(posinfo.ppqPosition, //which quarter measure we are on
             samplerate,
             samplesperblock,
             posinfo.bpm,
@@ -1050,7 +1193,14 @@ void SeqAudioProcessor::processBlock(AudioSampleBuffer& buffer, MidiBuffer& midi
 #ifdef CUBASE_HACKS
             ,mCubaseAtRestPos
 #endif
-         );
+         )) {
+            mSchedulingOverload = mOverloadLatched = true;
+            mPlaying = false;
+            stoppingPlayback = true;
+            for (auto &engine : mStocha)
+               engine.playbackStopped();
+            break;
+         }
          
       }
 
@@ -1064,7 +1214,7 @@ void SeqAudioProcessor::processBlock(AudioSampleBuffer& buffer, MidiBuffer& midi
 
    // now see whether the engine has any midi notes that need playing
    // right now. only while playing or quiescing
-   if (mPlaying || stoppingPlayback) { 
+   if (mPlaying || stoppingPlayback || emitResetOffs) {
       int8_t midi_note = 0, midi_velo = 0, midi_chan = 0;
       int midi_pos = 0;
       for (i = 0; i < SEQ_MAX_LAYERS; i++) {
@@ -1076,7 +1226,13 @@ void SeqAudioProcessor::processBlock(AudioSampleBuffer& buffer, MidiBuffer& midi
             else { // note off
                m = MidiMessage::noteOff(midi_chan, (int)midi_note);
             }
-            processedMidi.addEvent(m, midi_pos);
+            if (!appendPreparedMidi(processedMidi, m, midi_pos)) {
+               mOverloadLatched = true;
+               mPlaying = false;
+               for (auto &engine : mStocha)
+                  engine.playbackStopped();
+               break;
+            }
          } // get upcoming midi events and add them
       }
    }
@@ -1094,6 +1250,20 @@ void SeqAudioProcessor::processBlock(AudioSampleBuffer& buffer, MidiBuffer& midi
 
    // see if the UI has any data for us that we need to process
    checkforUIIncomingData(processedMidi);
+   if(mReleaseAuditions.exchange(false,std::memory_order_acquire))releaseAuditions(processedMidi);
+   if(mSchedulingOverload) {
+      mOverloadLatched=true;mPlaying=false;
+      for(auto &engine:mStocha)engine.playbackStopped();
+      for(auto &layer:mAuditions)for(auto &held:layer)held.note=-1;
+      mAuditionCount=0;
+      processedMidi.clear();mOutputEventCount=0;
+      // Native MIDI hosts also receive deterministic bounded recovery. WCLAP
+      // reports ERROR and its host releases downstream ownership as well.
+      for(int channel=1;channel<=16;++channel) {
+         appendPreparedMidi(processedMidi,MidiMessage::allSoundOff(channel),0);
+         appendPreparedMidi(processedMidi,MidiMessage::allNotesOff(channel),0);
+      }
+   }
    
    // flip from incoming midi data to outgoing data
    midiMessages.swapWith(processedMidi);
@@ -1118,12 +1288,20 @@ void SeqAudioProcessor::processBlock(AudioSampleBuffer& buffer, MidiBuffer& midi
 
 bool SeqAudioProcessor::hasEditor() const
 {
-    return true; // (change this to false if you choose to not supply an editor)
+#if defined(STOCHAS_WCLAP_DSP)
+    return false; // The full original editor is the separate webview module.
+#else
+    return true;
+#endif
 }
 
 AudioProcessorEditor* SeqAudioProcessor::createEditor()
 {   
+#if defined(STOCHAS_WCLAP_DSP)
+    return nullptr;
+#else
     return new SeqAudioProcessorEditor (*this);
+#endif
 }
 
 // not used anymore as we save to xml now
@@ -1144,7 +1322,7 @@ void
 SeqAudioProcessor::getStateInformation (MemoryBlock& block)
 {
    SeqPersist persist;
-   const XmlElement &xml=persist.store(mData.getAudSeqData());
+   const XmlElement &xml=persist.store(mData.getPublishedSeqData());
    //xml.writeToFile(juce::File("C:\\crap\\test.xml"), "");
    copyXmlToBinary(xml, block);
 
@@ -1170,30 +1348,21 @@ Code to load the plugin state from the daw project
 */
 void SeqAudioProcessor::setStateInformation (const void* in , int size)
 {
-   
-   std::unique_ptr<XmlElement> xml=getXmlFromBinary(in, size);
-   if (xml) {
-      SeqPersist persist;
-      // TODO - we are using the UI side since we are setting data. 
-      // we need to put a lock here or something
-      if (persist.retrieve(mData.getUISeqData(), xml.get()))
-         mData.swap();
-   }
+   loadCanonicalState(in, size);
+}
 
-   // tempo in saved state might differ, we need to recalculate some stuff here
-   changeStandaloneTempo();
+bool SeqAudioProcessor::loadCanonicalState(const void* in, int size)
+{
+   if (!in || size <= 0 || size > 64 * 1024 * 1024) return false;
+   auto xml = getXmlFromBinary(in, size);
+   if (!xml) return false;
+   auto prepared = std::make_unique<SequenceData>();
+   SeqPersist persist;
+   if (!persist.retrieve(prepared.get(), xml.get())) return false;
+   *mData.getUISeqData() = *prepared;
+   commitPreparedState();
 
-   // if we happen to be playing back at the time, we need to have the stocha's
-   // rebuild their midi mapping schemas
-   for (int i = 0; i < SEQ_MAX_LAYERS; i++) {
-      mStocha[i].resetMappingSchema();
-   }
-
-   // we also need to rebuild our mini midi map
-   rebuildMiniMidiMap();
-
-   // notify ui that state info is updated
-   mNotifier.uiNeedsUpdate();
+   return true;
 
 
    /* This is the code that just saves it as a block of memory.
@@ -1221,6 +1390,14 @@ void SeqAudioProcessor::setStateInformation (const void* in , int size)
    */
 }
 
+void SeqAudioProcessor::commitPreparedState()
+{
+   mNotifier.invalidateRecordedNotes();
+   mIncomingData.invalidateGeneration();
+   mData.swap(true);
+   mNotifier.uiNeedsUpdate();
+}
+
 
 AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
@@ -1236,7 +1413,7 @@ float SeqAudioProcessorParameter::getValue() const
    // host is getting value
    float ret;
    // convert mValue to a 0.0 to 1.0 range
-   ret = jmap<float>((float)mValue, (float)mRangeLo - 1.0f, (float)mRangeHi, 0.0f, 1.0f);   
+   ret = jmap<float>((float)mValue.get(), (float)mRangeLo - 1.0f, (float)mRangeHi, 0.0f, 1.0f);
    return ret;
 }
 
@@ -1256,10 +1433,10 @@ void SeqAudioProcessorParameter::setValue(float newValue)
    newValue = clampAutRange(newValue);
 
    // host is setting value
-   mValue = roundToInt(jmap<float>(newValue, (float)mRangeLo - 1.0f, (float)mRangeHi));
-   // if mValue is rangeLo-1 it means default
-   mNotify->automationParameterHasChanged(mParamId, mValue == mRangeLo - 1 ? 
-      SEQ_AUT_DEFAULT_VALUE_DESIG : mValue, mLayerNumber);
+   const int value = roundToInt(jmap<float>(newValue, (float)mRangeLo - 1.0f, (float)mRangeHi));
+   mValue.set(value);
+   mNotify->automationParameterHasChanged(mParamId, value == mRangeLo - 1 ?
+      SEQ_AUT_DEFAULT_VALUE_DESIG : value, mLayerNumber);
 }
 
 float SeqAudioProcessorParameter::getDefaultValue() const
@@ -1318,14 +1495,47 @@ SeqAudioProcessorParameter::SeqAudioProcessorParameter(AutParamNotify * notify,
 
 void SeqAudioProcessorParameter::reset()
 {
-   beginChangeGesture();
-   // this should implicitly call setValue with 1.0
-   setValueNotifyingHost(getDefaultValue());   
-   endChangeGesture();
+   // Stop/reset runs on audio. Host listener delivery is deferred by the parent
+   // through prepared flags; setValue retains the original DSP automation path.
+   setValue(getDefaultValue());
 }
 
 //==========implement AutParamNotify ============================
 void SeqAudioProcessor::automationParameterHasChanged(int paramId, int paramValue, int layer)
+{
+   if (layer >= 0 && layer < SEQ_MAX_LAYERS && paramId >= 1 && paramId <= 13)
+      queueAutomation((unsigned)(layer * 13 + paramId - 1), paramValue);
+   else if (layer == -1 && paramId == SEQ_AUT_GLOBAL_SWING) queueAutomation(52, paramValue);
+   else if (layer == -1 && paramId == SEQ_AUT_RECORD) queueAutomation(53, paramValue);
+   else jassertfalse;
+}
+
+void SeqAudioProcessor::queueAutomation(unsigned index, int value) noexcept
+{
+   if (index >= PendingAutomationCount) return;
+   mPendingAutomation[index].store(value, std::memory_order_relaxed);
+   if (index < 32) mPendingAutomationLow.fetch_or(uint32_t{1} << index, std::memory_order_release);
+   else mPendingAutomationHigh.fetch_or(uint32_t{1} << (index - 32), std::memory_order_release);
+}
+
+void SeqAudioProcessor::applyPendingAutomation()
+{
+   const uint64_t mask = uint64_t(mPendingAutomationLow.exchange(0, std::memory_order_acquire)) |
+      (uint64_t(mPendingAutomationHigh.exchange(0, std::memory_order_acquire)) << 32);
+   for (unsigned index = 0; index < PendingAutomationCount; ++index) {
+      if (!(mask & (uint64_t{1} << index))) continue;
+      const int value = mPendingAutomation[index].load(std::memory_order_relaxed);
+      if (index == 54) {
+         if (mData.getAudSeqData()->getAutoPlayMode() != SEQ_PLAYMODE_AUTO) {
+            if (value == 2) requestManualPlayback(true);
+            else if (value == 1) requestManualPlayback(false);
+         }
+      } else if (index < 52) applyAutomationParameter((int)(index % 13) + 1, value, (int)(index / 13));
+      else applyAutomationParameter(index == 52 ? SEQ_AUT_GLOBAL_SWING : SEQ_AUT_RECORD, value, -1);
+   }
+}
+
+void SeqAudioProcessor::applyAutomationParameter(int paramId, int paramValue, int layer)
 {
    // There is a special case for record start/stop. The stocha engines are
    // oblivious to this feature and its handled here in the processor
@@ -1370,6 +1580,7 @@ String SeqAudioProcessor::getTextForAutomationParameterValue(int paramId, int pa
       break;
    case SEQ_AUT_RECORD:
       ret = paramValue == 0 ? "off" : paramValue == 1 ? "on" : "";
+      break;
    case SEQ_AUT_MUTED: // no/yes
       if (paramValue)
          ret = "yes";
@@ -1444,9 +1655,10 @@ int SeqAudioProcessor::parseTextForAutomationParameterValue(int paramId, String 
 
 float SeqPlaybackParameter::getValue() const
 {
-   if (mValue == 0)
+   const int value = mValue.get();
+   if (value == 0)
       return 0.0f;
-   else if (mValue == 1)
+   else if (value == 1)
       return 0.5f;
    else
       return 1.0f;
@@ -1464,18 +1676,9 @@ float SeqPlaybackParameter::getValue() const
 void SeqPlaybackParameter::setValue(float newValue)
 {
    // host is setting value
-   mValue = roundToInt(jmap<float>(newValue, 0.0f, 2.0f));
-   
-   SequenceData *sd = mParent->mData.getAudSeqData();
-   if (sd->getAutoPlayMode() == SEQ_PLAYMODE_AUTO)
-      return;
-   
-   if (mValue == 2)
-      mParent->requestManualPlayback(true);
-   else if (mValue == 1)
-      mParent->requestManualPlayback(false);
-   else // as assigned
-      ;
+   const int value = roundToInt(jmap<float>(clampAutRange(newValue), 0.0f, 2.0f));
+   mValue.set(value);
+   mParent->queuePlaybackParameter(value);
 }
 
 String SeqPlaybackParameter::getText(float value, int) const
@@ -1493,7 +1696,7 @@ float SeqPlaybackParameter::getValueForText(const String & text) const
 {   
    if (text.compare("play") == 0)
       return 1.0f;
-   else if (text.compare("stop"))
+   else if (text.compare("stop") == 0)
       return 0.5f;
    else // manual
       return 0.0f;

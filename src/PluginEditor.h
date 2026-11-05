@@ -36,6 +36,7 @@ class SeqAudioProcessorEditor  : public AudioProcessorEditor,
 {
    LookAndFeel_V3 mLookAndFeel; // maintain the v3 look and feel
    SeqAudioProcessor& mProcessor;
+   bool mReportedOverload = false;
    // ================see the SeqAudioProcessorEditor ctor for more comments on each of these
    SeqGlob mGlob;
    Component mStepHolder;  

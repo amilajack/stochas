@@ -16,3 +16,4 @@ build.install/
 CMakeUserPresets.json
 ignore/*
 product/*
+web/**/__pycache__/
